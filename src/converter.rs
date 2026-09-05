@@ -1,62 +1,137 @@
+use crate::exchange::{NormalizedExchange, NormalizedRequest, NormalizedResponse};
 use crate::fcgi::{
-    fcgi_to_http_request, fcgi_to_http_response, parse_fcgi_request, parse_fcgi_response,
+    fcgi_to_http_request_bounded, fcgi_to_http_response_bounded, parse_fcgi_request,
+    parse_fcgi_response,
 };
 use crate::har::{
     Cache, Content, Cookie, Entry, Har, Header, Param, PostData, QueryParam, Request, Response,
     Timings,
 };
-use crate::http::{parse_request, parse_response, parse_all_requests, parse_all_responses, HttpConversation, ParsedRequest, ParsedResponse};
+use crate::http::{
+    copy_body_bounded, parse_all_requests_bounded, parse_all_responses_bounded,
+    parse_request_bounded, parse_response_bounded, HttpConversation, ParsedRequest, ParsedResponse,
+};
 use crate::http2::{is_http2, parse_http2_frames, parse_http2_stream, Http2Request, Http2Response};
-use crate::tcp::{StreamKey, TcpReassembler, TcpStream};
+use crate::tcp::{StreamKey, TcpStream};
 use crate::tls::{
     decrypt_tls12_record, decrypt_tls13_record_full, derive_tls12_keys, extract_cipher_suite,
     extract_client_random, extract_server_random, parse_tls_records, CipherSuiteInfo, TlsSecrets,
 };
-use std::collections::HashMap;
+use chrono::{DateTime, Utc};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use url::Url;
 
 pub struct Converter {
-    conversations: Vec<HttpConversation>,
+    exchanges: Vec<NormalizedExchange>,
+    tcp_exchange_indices: Vec<usize>,
+    max_body_bytes: usize,
+    remaining_body_bytes: usize,
+    body_limit_exceeded: bool,
 }
 
 impl Converter {
     pub fn new() -> Self {
+        Self::with_limits(&crate::DecodeLimits::default())
+    }
+
+    pub(crate) fn with_limits(limits: &crate::DecodeLimits) -> Self {
         Converter {
-            conversations: Vec::new(),
+            exchanges: Vec::new(),
+            tcp_exchange_indices: Vec::new(),
+            max_body_bytes: limits.max_body_bytes,
+            remaining_body_bytes: limits.max_total_buffered_bytes,
+            body_limit_exceeded: false,
         }
     }
 
-    pub fn process_streams(&mut self, streams: HashMap<StreamKey, TcpStream>) {
-        let mut request_streams: HashMap<StreamKey, (Vec<chrono::DateTime<chrono::Utc>>, Vec<ParsedRequest>)> = HashMap::new();
-        let mut response_streams: HashMap<StreamKey, (Vec<chrono::DateTime<chrono::Utc>>, Vec<ParsedResponse>)> = HashMap::new();
+    pub(crate) fn body_limit_exceeded(&self) -> bool {
+        self.body_limit_exceeded
+    }
 
-        for (key, stream) in &streams {
+    fn available_body_bytes(&self) -> usize {
+        self.max_body_bytes.min(self.remaining_body_bytes)
+    }
+
+    fn account_body(&mut self, body_bytes: usize, limit_exceeded: bool) {
+        self.body_limit_exceeded |= limit_exceeded || body_bytes > self.remaining_body_bytes;
+        self.remaining_body_bytes = self.remaining_body_bytes.saturating_sub(body_bytes);
+    }
+
+    pub fn add_exchange(&mut self, exchange: NormalizedExchange) {
+        self.exchanges.push(exchange);
+    }
+
+    fn add_conversation(
+        &mut self,
+        conversation: HttpConversation,
+        scheme: &str,
+        authority: Option<&str>,
+        stream_id: u64,
+    ) {
+        let exchange_index = self.exchanges.len();
+        self.exchanges.push(normalize_conversation(
+            conversation,
+            scheme,
+            authority,
+            stream_id,
+        ));
+        self.tcp_exchange_indices.push(exchange_index);
+    }
+
+    pub fn process_streams(&mut self, streams: HashMap<StreamKey, TcpStream>) {
+        let mut request_streams: HashMap<
+            StreamKey,
+            (Vec<chrono::DateTime<chrono::Utc>>, Vec<ParsedRequest>),
+        > = HashMap::new();
+        let mut response_streams: HashMap<
+            StreamKey,
+            (Vec<chrono::DateTime<chrono::Utc>>, Vec<ParsedResponse>),
+        > = HashMap::new();
+
+        let mut ordered_streams: Vec<_> = streams.iter().collect();
+        ordered_streams.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (key, stream) in ordered_streams {
             let (data, timestamps) = stream.reassemble();
             if data.is_empty() {
                 continue;
             }
 
-            let requests = parse_all_requests(&data);
+            let (requests, limited) =
+                parse_all_requests_bounded(&data, self.max_body_bytes, self.remaining_body_bytes);
             if !requests.is_empty() {
+                for request in &requests {
+                    self.account_body(request.body.len(), limited);
+                }
                 request_streams.insert(key.clone(), (timestamps.clone(), requests));
                 continue;
             }
 
-            let responses = parse_all_responses(&data);
+            let (responses, limited) =
+                parse_all_responses_bounded(&data, self.max_body_bytes, self.remaining_body_bytes);
             if !responses.is_empty() {
+                for response in &responses {
+                    self.account_body(response.body.len(), limited);
+                }
                 response_streams.insert(key.clone(), (timestamps.clone(), responses));
                 continue;
             }
 
             if let Some(fcgi_req) = parse_fcgi_request(&data) {
-                if let Some(req) = fcgi_to_http_request(&fcgi_req) {
+                let (request, limited) =
+                    fcgi_to_http_request_bounded(&fcgi_req, self.available_body_bytes());
+                if let Some(req) = request {
+                    self.account_body(req.body.len(), limited);
                     request_streams.insert(key.clone(), (timestamps.clone(), vec![req]));
                     continue;
                 }
             }
 
             if let Some(fcgi_resp) = parse_fcgi_response(&data) {
-                if let Some(resp) = fcgi_to_http_response(&fcgi_resp) {
+                let (response, limited) =
+                    fcgi_to_http_response_bounded(&fcgi_resp, self.available_body_bytes());
+                if let Some(resp) = response {
+                    self.account_body(resp.body.len(), limited);
                     response_streams.insert(key.clone(), (timestamps.clone(), vec![resp]));
                 }
             }
@@ -66,7 +141,9 @@ impl Converter {
             let resp_key = req_key.reverse();
             let response_data = response_streams.get(&resp_key);
 
-            let responses = response_data.map(|(_, resps)| resps.as_slice()).unwrap_or(&[]);
+            let responses = response_data
+                .map(|(_, resps)| resps.as_slice())
+                .unwrap_or(&[]);
             let resp_timestamps = response_data.map(|(ts, _)| ts.clone()).unwrap_or_default();
 
             for (i, request) in requests.iter().enumerate() {
@@ -83,7 +160,7 @@ impl Converter {
                     response_timestamps: resp_timestamps.clone(),
                 };
 
-                self.conversations.push(conversation);
+                self.add_conversation(conversation, "http", None, 0);
             }
         }
     }
@@ -99,13 +176,15 @@ impl Converter {
         let mut server_randoms: HashMap<StreamKey, String> = HashMap::new();
         let mut cipher_suites: HashMap<StreamKey, u16> = HashMap::new();
 
-        for (key, stream) in &streams {
+        let mut ordered_streams: Vec<_> = streams.iter().collect();
+        ordered_streams.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (key, stream) in ordered_streams {
             let (data, timestamps) = stream.reassemble();
             if data.is_empty() {
                 continue;
             }
 
-            if key.dst_port == 443 || key.src_port == 443 || is_tls_data(&data) {
+            if is_tls_data(&data) {
                 let records = parse_tls_records(&data);
                 for record in &records {
                     if record.content_type == 22 {
@@ -124,18 +203,21 @@ impl Converter {
             }
         }
 
-        let mut decrypted_streams: HashMap<StreamKey, (Vec<u8>, Vec<chrono::DateTime<chrono::Utc>>)> =
-            HashMap::new();
+        let mut decrypted_streams: HashMap<
+            StreamKey,
+            (Vec<u8>, Vec<chrono::DateTime<chrono::Utc>>),
+        > = HashMap::new();
         for (key, (data, timestamps)) in &tls_streams {
             let reverse = key.reverse();
-            let client_random = client_randoms.get(key).or_else(|| client_randoms.get(&reverse));
+            let client_random = client_randoms
+                .get(key)
+                .or_else(|| client_randoms.get(&reverse));
 
             let Some(random) = client_random else {
                 continue;
             };
-
+            let is_client = client_randoms.contains_key(key);
             if let Some(secrets) = tls_secrets.traffic_secrets.get(random) {
-                let is_client = key.dst_port == 443;
                 let secret = if is_client {
                     secrets.client_traffic_secret_0.as_ref()
                 } else {
@@ -147,34 +229,34 @@ impl Converter {
                         decrypted_streams.insert(key.clone(), (decrypted, timestamps.clone()));
                     }
                 }
-            } else if let Some(client_secrets) = tls_secrets.client_randoms.get(random) {
-                if let Some(master_secret) = &client_secrets.master_secret {
-                    let is_client = key.dst_port == 443;
-                    let server_random_hex = if is_client {
-                        server_randoms.get(&reverse)
-                    } else {
-                        server_randoms.get(key)
-                    };
+            } else if let Some(master_secret) = tls_secrets
+                .client_randoms
+                .get(random)
+                .and_then(|secrets| secrets.master_secret.as_deref())
+            {
+                let server_random_hex = if is_client {
+                    server_randoms.get(&reverse)
+                } else {
+                    server_randoms.get(key)
+                };
 
-                    let cipher_suite = if is_client {
-                        cipher_suites.get(&reverse).copied()
-                    } else {
-                        cipher_suites.get(key).copied()
-                    };
+                let cipher_suite = if is_client {
+                    cipher_suites.get(&reverse).copied()
+                } else {
+                    cipher_suites.get(key).copied()
+                };
 
-                    if let (Some(server_random_hex), Some(suite)) = (server_random_hex, cipher_suite)
-                    {
-                        if let Some(cipher_info) = CipherSuiteInfo::from_id(suite) {
-                            if let Some(decrypted) = self.decrypt_tls12_stream(
-                                data,
-                                master_secret,
-                                random,
-                                server_random_hex,
-                                &cipher_info,
-                                is_client,
-                            ) {
-                                decrypted_streams.insert(key.clone(), (decrypted, timestamps.clone()));
-                            }
+                if let (Some(server_random_hex), Some(suite)) = (server_random_hex, cipher_suite) {
+                    if let Some(cipher_info) = CipherSuiteInfo::from_id(suite) {
+                        if let Some(decrypted) = self.decrypt_tls12_stream(
+                            data,
+                            master_secret,
+                            random,
+                            server_random_hex,
+                            &cipher_info,
+                            is_client,
+                        ) {
+                            decrypted_streams.insert(key.clone(), (decrypted, timestamps.clone()));
                         }
                     }
                 }
@@ -198,10 +280,12 @@ impl Converter {
             (Vec<chrono::DateTime<chrono::Utc>>, Vec<Http2Response>),
         > = HashMap::new();
 
-        for (key, (data, timestamps)) in &decrypted_streams {
+        let mut ordered_decrypted_streams: Vec<_> = decrypted_streams.iter().collect();
+        ordered_decrypted_streams.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (key, (data, timestamps)) in ordered_decrypted_streams {
             if is_http2(data) {
                 let frames = parse_http2_frames(data);
-                let is_client = key.dst_port == 443;
+                let is_client = client_randoms.contains_key(key);
                 let (reqs, resps) = parse_http2_stream(&frames, is_client);
 
                 if is_client && !reqs.is_empty() {
@@ -209,9 +293,15 @@ impl Converter {
                 } else if !is_client && !resps.is_empty() {
                     h2_responses.insert(key.clone(), (timestamps.clone(), resps));
                 }
-            } else if let Ok(Some(req)) = parse_request(data) {
+            } else if let Ok((Some(req), limited)) =
+                parse_request_bounded(data, self.available_body_bytes())
+            {
+                self.account_body(req.body.len(), limited);
                 request_streams.insert(key.clone(), (timestamps.clone(), req));
-            } else if let Ok(Some(resp)) = parse_response(data) {
+            } else if let Ok((Some(resp), limited)) =
+                parse_response_bounded(data, self.available_body_bytes())
+            {
+                self.account_body(resp.body.len(), limited);
                 response_streams.insert(key.clone(), (timestamps.clone(), resp));
             }
         }
@@ -231,10 +321,12 @@ impl Converter {
                 response_timestamps: response_data.map(|(ts, _)| ts).unwrap_or_default(),
             };
 
-            self.conversations.push(conversation);
+            self.add_conversation(conversation, "https", None, 0);
         }
 
-        for (req_key, (req_timestamps, requests)) in h2_requests {
+        let mut ordered_h2_requests: Vec<_> = h2_requests.into_iter().collect();
+        ordered_h2_requests.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (req_key, (req_timestamps, requests)) in ordered_h2_requests {
             let resp_key = req_key.reverse();
             let response_data = h2_responses.remove(&resp_key);
 
@@ -248,22 +340,29 @@ impl Converter {
                     headers.push(("host".to_string(), h2_req.authority.clone()));
                 }
 
+                let (request_body, request_limited) =
+                    copy_body_bounded(&h2_req.body, self.available_body_bytes());
+                self.account_body(request_body.len(), request_limited);
                 let parsed_req = ParsedRequest {
                     method: h2_req.method.clone(),
                     path: h2_req.path.clone(),
                     version: "HTTP/2".to_string(),
                     headers,
-                    body: h2_req.body.clone(),
+                    body: request_body,
                     header_size: 0,
                 };
 
-                let parsed_resp = h2_resp.map(|r| ParsedResponse {
-                    version: "HTTP/2".to_string(),
-                    status: r.status,
-                    reason: String::new(),
-                    headers: r.headers.clone(),
-                    body: r.body.clone(),
-                    header_size: 0,
+                let parsed_resp = h2_resp.map(|r| {
+                    let (body, limited) = copy_body_bounded(&r.body, self.available_body_bytes());
+                    self.account_body(body.len(), limited);
+                    ParsedResponse {
+                        version: "HTTP/2".to_string(),
+                        status: r.status,
+                        reason: String::new(),
+                        headers: r.headers.clone(),
+                        body,
+                        header_size: 0,
+                    }
                 });
 
                 let conversation = HttpConversation {
@@ -280,7 +379,17 @@ impl Converter {
                         .unwrap_or_default(),
                 };
 
-                self.conversations.push(conversation);
+                let scheme = if h2_req.scheme.is_empty() {
+                    "https"
+                } else {
+                    &h2_req.scheme
+                };
+                self.add_conversation(
+                    conversation,
+                    scheme,
+                    Some(&h2_req.authority),
+                    u64::from(h2_req.stream_id),
+                );
             }
         }
 
@@ -295,7 +404,7 @@ impl Converter {
     fn decrypt_tls13_stream(&self, data: &[u8], secret: &[u8]) -> Option<Vec<u8>> {
         let records = parse_tls_records(data);
         let app_records: Vec<_> = records.iter().filter(|r| r.content_type == 23).collect();
-        
+
         if app_records.is_empty() {
             return None;
         }
@@ -373,54 +482,39 @@ impl Converter {
     }
 
     pub fn to_har(mut self) -> Har {
-        let mut har = Har::new();
-
-        self.conversations.sort_by_key(|c| c.start_time());
-
-        for (i, conv) in self.conversations.iter().enumerate() {
-            let mut entry = self.conversation_to_entry(conv);
-            entry.pageref = format!("page_{}", i);
-            har.add_entry(entry);
-        }
-
-        har
+        assign_tcp_connection_sequences(&mut self.exchanges, &self.tcp_exchange_indices);
+        normalized_exchanges_to_har(self.exchanges)
     }
 
-    fn conversation_to_entry(&self, conv: &HttpConversation) -> Entry {
-        let url = self.build_url(conv);
-        let request = self.build_request(&conv.request, &url);
-        let response = self.build_response(conv.response.as_ref());
+    fn exchange_to_entry(&self, exchange: &NormalizedExchange) -> Entry {
+        let url = self.build_url(&exchange.request);
+        let request = self.build_request(&exchange.request, &url);
+        let response = self.build_response(exchange.response.as_ref(), &exchange.request.version);
+        let duration = exchange
+            .ended_ns
+            .saturating_sub(exchange.request_started_ns);
 
         Entry {
             pageref: String::new(),
-            started_date_time: conv.start_time(),
-            time: conv.duration_ns(),
+            started_date_time: timestamp_to_datetime(exchange.request_started_ns),
+            time: i64::try_from(duration).unwrap_or(i64::MAX),
             request,
             response,
             cache: Cache {},
             timings: Timings::default(),
-            server_ip_address: Some(conv.dst_ip.clone()),
+            server_ip_address: Some(exchange.server.ip().to_string()),
         }
     }
 
-    fn build_url(&self, conv: &HttpConversation) -> String {
-        let host = conv
-            .request
-            .headers
-            .iter()
-            .find(|(k, _)| k.to_lowercase() == "host")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or(&conv.dst_ip);
-
-        let scheme = if conv.dst_port == 443 { "https" } else { "http" };
-
-        format!("{}://{}{}", scheme, host, conv.request.path)
+    fn build_url(&self, request: &NormalizedRequest) -> String {
+        format!("{}://{}{}", request.scheme, request.authority, request.path)
     }
 
-    fn build_request(&self, req: &ParsedRequest, url: &str) -> Request {
+    fn build_request(&self, req: &NormalizedRequest, url: &str) -> Request {
         let headers: Vec<Header> = req
             .headers
             .iter()
+            .chain(&req.trailers)
             .map(|(k, v)| Header {
                 name: k.clone(),
                 value: v.clone(),
@@ -444,12 +538,13 @@ impl Converter {
         }
     }
 
-    fn build_response(&self, resp: Option<&ParsedResponse>) -> Response {
+    fn build_response(&self, resp: Option<&NormalizedResponse>, request_version: &str) -> Response {
         match resp {
             Some(resp) => {
                 let headers: Vec<Header> = resp
                     .headers
                     .iter()
+                    .chain(&resp.trailers)
                     .map(|(k, v)| Header {
                         name: k.clone(),
                         value: v.clone(),
@@ -481,7 +576,7 @@ impl Converter {
             None => Response {
                 status: 0,
                 status_text: String::new(),
-                http_version: "HTTP/1.1".to_string(),
+                http_version: request_version.to_string(),
                 cookies: Vec::new(),
                 headers: Vec::new(),
                 content: Content {
@@ -498,7 +593,7 @@ impl Converter {
         }
     }
 
-    fn build_content(&self, resp: &ParsedResponse) -> Content {
+    fn build_content(&self, resp: &NormalizedResponse) -> Content {
         let mime_type = resp
             .headers
             .iter()
@@ -604,7 +699,7 @@ impl Converter {
             .unwrap_or_default()
     }
 
-    fn parse_post_data(&self, req: &ParsedRequest) -> Option<PostData> {
+    fn parse_post_data(&self, req: &NormalizedRequest) -> Option<PostData> {
         if req.body.is_empty() {
             return None;
         }
@@ -650,6 +745,147 @@ impl Converter {
     }
 }
 
+fn normalize_conversation(
+    conversation: HttpConversation,
+    scheme: &str,
+    authority: Option<&str>,
+    stream_id: u64,
+) -> NormalizedExchange {
+    let client_ip = conversation
+        .src_ip
+        .parse::<IpAddr>()
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let server_ip = conversation
+        .dst_ip
+        .parse::<IpAddr>()
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let client = SocketAddr::new(client_ip, conversation.src_port);
+    let server = SocketAddr::new(server_ip, conversation.dst_port);
+    let authority = authority
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            conversation
+                .request
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+                .map(|(_, value)| value.clone())
+        })
+        .unwrap_or_else(|| authority_from_server(server, scheme));
+    let request_started_ns = conversation
+        .request_timestamps
+        .first()
+        .and_then(datetime_to_timestamp)
+        .unwrap_or_default();
+    let response_started_ns = conversation
+        .response_timestamps
+        .first()
+        .and_then(datetime_to_timestamp);
+    let ended_ns = conversation
+        .response_timestamps
+        .last()
+        .or_else(|| conversation.request_timestamps.last())
+        .and_then(datetime_to_timestamp)
+        .unwrap_or(request_started_ns);
+
+    NormalizedExchange {
+        connection_sequence: 0,
+        stream_id,
+        client,
+        server,
+        request: NormalizedRequest {
+            method: conversation.request.method,
+            scheme: scheme.to_string(),
+            authority,
+            path: conversation.request.path,
+            version: conversation.request.version,
+            headers: conversation.request.headers,
+            trailers: Vec::new(),
+            body: conversation.request.body,
+            header_size: conversation.request.header_size,
+        },
+        response: conversation.response.map(|response| NormalizedResponse {
+            status: response.status,
+            reason: response.reason,
+            version: response.version,
+            headers: response.headers,
+            trailers: Vec::new(),
+            body: response.body,
+            header_size: response.header_size,
+        }),
+        request_started_ns,
+        response_started_ns,
+        ended_ns,
+    }
+}
+
+fn datetime_to_timestamp(value: &DateTime<Utc>) -> Option<u64> {
+    value
+        .timestamp_nanos_opt()
+        .and_then(|ns| u64::try_from(ns).ok())
+}
+
+fn timestamp_to_datetime(value: u64) -> DateTime<Utc> {
+    DateTime::from_timestamp_nanos(i64::try_from(value).unwrap_or(i64::MAX))
+}
+
+fn authority_from_server(server: SocketAddr, scheme: &str) -> String {
+    let host = match server.ip() {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    let is_default_port =
+        (scheme == "http" && server.port() == 80) || (scheme == "https" && server.port() == 443);
+    if is_default_port {
+        host
+    } else {
+        format!("{host}:{}", server.port())
+    }
+}
+
+fn assign_tcp_connection_sequences(
+    exchanges: &mut [NormalizedExchange],
+    tcp_exchange_indices: &[usize],
+) {
+    let endpoints = tcp_exchange_indices
+        .iter()
+        .filter_map(|index| exchanges.get(*index))
+        .map(|exchange| (exchange.client, exchange.server))
+        .collect::<BTreeSet<_>>();
+    let sequences = endpoints
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, endpoints)| (endpoints, u64::try_from(sequence).unwrap_or(u64::MAX)))
+        .collect::<BTreeMap<_, _>>();
+
+    for index in tcp_exchange_indices {
+        if let Some(exchange) = exchanges.get_mut(*index) {
+            exchange.connection_sequence = sequences
+                .get(&(exchange.client, exchange.server))
+                .copied()
+                .unwrap_or(u64::MAX);
+        }
+    }
+}
+
+pub fn normalized_exchanges_to_har(mut exchanges: Vec<NormalizedExchange>) -> Har {
+    exchanges.sort_by(|left, right| {
+        left.request_started_ns
+            .cmp(&right.request_started_ns)
+            .then_with(|| left.connection_sequence.cmp(&right.connection_sequence))
+            .then_with(|| left.stream_id.cmp(&right.stream_id))
+            .then_with(|| left.cmp(right))
+    });
+
+    let converter = Converter::new();
+    let mut har = Har::new();
+    for exchange in &exchanges {
+        har.add_entry(converter.exchange_to_entry(exchange));
+    }
+    har
+}
+
 impl Default for Converter {
     fn default() -> Self {
         Self::new()
@@ -676,16 +912,12 @@ fn is_tls_data(data: &[u8]) -> bool {
 }
 
 pub fn convert_pcap_to_har(pcap_path: &str) -> Result<Har, crate::tcp::TcpError> {
-    let mut reassembler = TcpReassembler::new();
-    reassembler.process_pcap(pcap_path)?;
-
-    let tls_secrets = reassembler.tls_secrets.clone();
-    let streams = reassembler.get_streams();
-
-    let mut converter = Converter::new();
-    converter.process_streams_with_tls(streams, &tls_secrets);
-
-    Ok(converter.to_har())
+    crate::convert_capture(
+        std::path::Path::new(pcap_path),
+        crate::ConversionOptions::default(),
+    )
+    .map(|report| report.har)
+    .map_err(|_| crate::tcp::TcpError::Parse("capture conversion failed".to_string()))
 }
 
 #[cfg(test)]
@@ -694,10 +926,36 @@ mod tests {
     use crate::http::{ParsedRequest, ParsedResponse};
     use chrono::Utc;
 
+    fn normalized_request(request: ParsedRequest) -> NormalizedRequest {
+        NormalizedRequest {
+            method: request.method,
+            scheme: "http".to_string(),
+            authority: "example.test".to_string(),
+            path: request.path,
+            version: request.version,
+            headers: request.headers,
+            trailers: Vec::new(),
+            body: request.body,
+            header_size: request.header_size,
+        }
+    }
+
+    fn normalized_response(response: ParsedResponse) -> NormalizedResponse {
+        NormalizedResponse {
+            status: response.status,
+            reason: response.reason,
+            version: response.version,
+            headers: response.headers,
+            trailers: Vec::new(),
+            body: response.body,
+            header_size: response.header_size,
+        }
+    }
+
     #[test]
     fn test_converter_new() {
         let converter = Converter::new();
-        assert_eq!(converter.conversations.len(), 0);
+        assert_eq!(converter.exchanges.len(), 0);
     }
 
     #[test]
@@ -708,9 +966,7 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/api/data".to_string(),
                 version: "HTTP/1.1".to_string(),
-                headers: vec![
-                    ("Host".to_string(), "example.com".to_string()),
-                ],
+                headers: vec![("Host".to_string(), "example.com".to_string())],
                 body: vec![],
                 header_size: 0,
             },
@@ -723,7 +979,8 @@ mod tests {
             response_timestamps: vec![],
         };
 
-        let url = converter.build_url(&conv);
+        let exchange = normalize_conversation(conv, "http", None, 0);
+        let url = converter.build_url(&exchange.request);
         assert_eq!(url, "http://example.com/api/data");
     }
 
@@ -735,9 +992,7 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/secure".to_string(),
                 version: "HTTP/1.1".to_string(),
-                headers: vec![
-                    ("Host".to_string(), "secure.example.com".to_string()),
-                ],
+                headers: vec![("Host".to_string(), "secure.example.com".to_string())],
                 body: vec![],
                 header_size: 0,
             },
@@ -745,12 +1000,13 @@ mod tests {
             src_ip: "192.168.1.10".to_string(),
             dst_ip: "93.184.216.34".to_string(),
             src_port: 54321,
-            dst_port: 443,  // HTTPS port
+            dst_port: 443, // HTTPS port
             request_timestamps: vec![],
             response_timestamps: vec![],
         };
 
-        let url = converter.build_url(&conv);
+        let exchange = normalize_conversation(conv, "https", None, 0);
+        let url = converter.build_url(&exchange.request);
         assert_eq!(url, "https://secure.example.com/secure");
     }
 
@@ -775,20 +1031,22 @@ mod tests {
             response_timestamps: vec![],
         };
 
-        let url = converter.build_url(&conv);
-        assert_eq!(url, "http://127.0.0.1/");
+        let exchange = normalize_conversation(conv, "http", None, 0);
+        let url = converter.build_url(&exchange.request);
+        assert_eq!(url, "http://127.0.0.1:8080/");
     }
 
     #[test]
     fn test_parse_cookies_from_headers() {
         let converter = Converter::new();
-        let headers = vec![
-            ("Cookie".to_string(), "session=abc123; user=john".to_string()),
-        ];
+        let headers = vec![(
+            "Cookie".to_string(),
+            "session=abc123; user=john".to_string(),
+        )];
 
         let cookies = converter.parse_cookies(&headers);
         assert_eq!(cookies.len(), 2);
-        
+
         assert_eq!(cookies[0].name, "session");
         assert_eq!(cookies[0].value, "abc123");
         assert_eq!(cookies[1].name, "user");
@@ -798,14 +1056,14 @@ mod tests {
     #[test]
     fn test_parse_set_cookies_with_attributes() {
         let converter = Converter::new();
-        let headers = vec![
-            ("Set-Cookie".to_string(), 
-             "session=xyz; Path=/; Domain=.example.com; HttpOnly; Secure".to_string()),
-        ];
+        let headers = vec![(
+            "Set-Cookie".to_string(),
+            "session=xyz; Path=/; Domain=.example.com; HttpOnly; Secure".to_string(),
+        )];
 
         let cookies = converter.parse_set_cookies(&headers);
         assert_eq!(cookies.len(), 1);
-        
+
         let cookie = &cookies[0];
         assert_eq!(cookie.name, "session");
         assert_eq!(cookie.value, "xyz");
@@ -822,7 +1080,7 @@ mod tests {
 
         let params = converter.parse_query_string(url);
         assert_eq!(params.len(), 3);
-        
+
         assert_eq!(params[0].name, "q");
         assert_eq!(params[0].value, "rust");
         assert_eq!(params[1].name, "lang");
@@ -838,7 +1096,7 @@ mod tests {
 
         let params = converter.parse_query_string(url);
         assert_eq!(params.len(), 2);
-        
+
         assert_eq!(params[0].name, "q");
         assert_eq!(params[0].value, "hello world");
         assert_eq!(params[1].name, "special");
@@ -852,16 +1110,18 @@ mod tests {
             method: "POST".to_string(),
             path: "/api".to_string(),
             version: "HTTP/1.1".to_string(),
-            headers: vec![
-                ("Content-Type".to_string(), "application/json; charset=utf-8".to_string()),
-            ],
+            headers: vec![(
+                "Content-Type".to_string(),
+                "application/json; charset=utf-8".to_string(),
+            )],
             body: br#"{"name":"test","value":123}"#.to_vec(),
             header_size: 0,
         };
 
+        let req = normalized_request(req);
         let post_data = converter.parse_post_data(&req);
         assert!(post_data.is_some());
-        
+
         let data = post_data.unwrap();
         assert_eq!(data.mime_type, "application/json");
         assert_eq!(data.text.unwrap(), r#"{"name":"test","value":123}"#);
@@ -875,20 +1135,22 @@ mod tests {
             method: "POST".to_string(),
             path: "/submit".to_string(),
             version: "HTTP/1.1".to_string(),
-            headers: vec![
-                ("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string()),
-            ],
+            headers: vec![(
+                "Content-Type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            )],
             body: b"name=John&email=john%40example.com&age=30".to_vec(),
             header_size: 0,
         };
 
+        let req = normalized_request(req);
         let post_data = converter.parse_post_data(&req);
         assert!(post_data.is_some());
-        
+
         let data = post_data.unwrap();
         assert_eq!(data.mime_type, "application/x-www-form-urlencoded");
         assert!(data.params.is_some());
-        
+
         let params = data.params.unwrap();
         assert_eq!(params.len(), 3);
         assert_eq!(params[0].name, "name");
@@ -907,6 +1169,7 @@ mod tests {
             header_size: 0,
         };
 
+        let req = normalized_request(req);
         let post_data = converter.parse_post_data(&req);
         assert!(post_data.is_none());
     }
@@ -926,7 +1189,8 @@ mod tests {
             header_size: 0,
         };
 
-        let response = converter.build_response(Some(&resp));
+        let resp = normalized_response(resp);
+        let response = converter.build_response(Some(&resp), "HTTP/1.1");
         assert_eq!(response.status, 200);
         assert_eq!(response.status_text, "OK");
         assert_eq!(response.content.mime_type, "application/json");
@@ -937,8 +1201,8 @@ mod tests {
     #[test]
     fn test_build_response_none() {
         let converter = Converter::new();
-        let response = converter.build_response(None);
-        
+        let response = converter.build_response(None, "HTTP/1.1");
+
         assert_eq!(response.status, 0);
         assert_eq!(response.status_text, "");
         assert_eq!(response.content.size, 0);
@@ -953,13 +1217,15 @@ mod tests {
             status: 200,
             reason: "OK".to_string(),
             version: "HTTP/1.1".to_string(),
-            headers: vec![
-                ("Content-Type".to_string(), "text/html; charset=utf-8".to_string()),
-            ],
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            )],
             body: b"<html><body>Hello</body></html>".to_vec(),
             header_size: 0,
         };
 
+        let resp = normalized_response(resp);
         let content = converter.build_content(&resp);
         assert_eq!(content.mime_type, "text/html");
         assert!(content.text.is_some());
@@ -973,13 +1239,12 @@ mod tests {
             status: 200,
             reason: "OK".to_string(),
             version: "HTTP/1.1".to_string(),
-            headers: vec![
-                ("Content-Type".to_string(), "image/png".to_string()),
-            ],
+            headers: vec![("Content-Type".to_string(), "image/png".to_string())],
             body: vec![0x89, 0x50, 0x4E, 0x47], // PNG header
             header_size: 0,
         };
 
+        let resp = normalized_response(resp);
         let content = converter.build_content(&resp);
         assert_eq!(content.mime_type, "image/png");
         assert!(content.text.is_some());
@@ -993,7 +1258,7 @@ mod tests {
         assert!(is_text_content("application/json"));
         assert!(is_text_content("application/xml"));
         assert!(is_text_content("application/javascript"));
-        
+
         assert!(!is_text_content("image/png"));
         assert!(!is_text_content("application/octet-stream"));
         assert!(!is_text_content("video/mp4"));
@@ -1018,15 +1283,13 @@ mod tests {
     fn test_conversation_to_entry() {
         let converter = Converter::new();
         let now = Utc::now();
-        
+
         let conv = HttpConversation {
             request: ParsedRequest {
                 method: "GET".to_string(),
                 path: "/test".to_string(),
                 version: "HTTP/1.1".to_string(),
-                headers: vec![
-                    ("Host".to_string(), "example.com".to_string()),
-                ],
+                headers: vec![("Host".to_string(), "example.com".to_string())],
                 body: vec![],
                 header_size: 100,
             },
@@ -1046,7 +1309,8 @@ mod tests {
             response_timestamps: vec![now],
         };
 
-        let entry = converter.conversation_to_entry(&conv);
+        let exchange = normalize_conversation(conv, "http", None, 0);
+        let entry = converter.exchange_to_entry(&exchange);
         assert_eq!(entry.request.method, "GET");
         assert_eq!(entry.response.status, 200);
         assert_eq!(entry.server_ip_address, Some("93.184.216.34".to_string()));
@@ -1069,32 +1333,35 @@ mod tests {
         let now = Utc::now();
 
         // Add a conversation
-        converter.conversations.push(HttpConversation {
-            request: ParsedRequest {
-                method: "GET".to_string(),
-                path: "/".to_string(),
-                version: "HTTP/1.1".to_string(),
-                headers: vec![
-                    ("Host".to_string(), "example.com".to_string()),
-                ],
-                body: vec![],
-                header_size: 0,
+        converter.add_conversation(
+            HttpConversation {
+                request: ParsedRequest {
+                    method: "GET".to_string(),
+                    path: "/".to_string(),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("Host".to_string(), "example.com".to_string())],
+                    body: vec![],
+                    header_size: 0,
+                },
+                response: Some(ParsedResponse {
+                    status: 200,
+                    reason: "OK".to_string(),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![],
+                    body: vec![],
+                    header_size: 0,
+                }),
+                src_ip: "127.0.0.1".to_string(),
+                dst_ip: "127.0.0.1".to_string(),
+                src_port: 12345,
+                dst_port: 80,
+                request_timestamps: vec![now],
+                response_timestamps: vec![now],
             },
-            response: Some(ParsedResponse {
-                status: 200,
-                reason: "OK".to_string(),
-                version: "HTTP/1.1".to_string(),
-                headers: vec![],
-                body: vec![],
-                header_size: 0,
-            }),
-            src_ip: "127.0.0.1".to_string(),
-            dst_ip: "127.0.0.1".to_string(),
-            src_port: 12345,
-            dst_port: 80,
-            request_timestamps: vec![now],
-            response_timestamps: vec![now],
-        });
+            "http",
+            None,
+            0,
+        );
 
         let har = converter.to_har();
 
@@ -1107,65 +1374,80 @@ mod tests {
     #[test]
     fn test_converter_sorts_conversations_by_time() {
         use chrono::Duration;
-        
+
         let mut converter = Converter::new();
         let now = Utc::now();
         let earlier = now - Duration::seconds(10);
         let later = now + Duration::seconds(10);
 
-        converter.conversations.push(HttpConversation {
-            request: ParsedRequest {
-                method: "GET".to_string(),
-                path: "/second".to_string(),
-                version: "HTTP/1.1".to_string(),
-                headers: vec![],
-                body: vec![],
-                header_size: 0,
+        converter.add_conversation(
+            HttpConversation {
+                request: ParsedRequest {
+                    method: "GET".to_string(),
+                    path: "/second".to_string(),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![],
+                    body: vec![],
+                    header_size: 0,
+                },
+                response: None,
+                src_ip: "127.0.0.1".to_string(),
+                dst_ip: "127.0.0.1".to_string(),
+                src_port: 12345,
+                dst_port: 80,
+                request_timestamps: vec![now],
+                response_timestamps: vec![],
             },
-            response: None,
-            src_ip: "127.0.0.1".to_string(),
-            dst_ip: "127.0.0.1".to_string(),
-            src_port: 12345,
-            dst_port: 80,
-            request_timestamps: vec![now],
-            response_timestamps: vec![],
-        });
+            "http",
+            None,
+            0,
+        );
 
-        converter.conversations.push(HttpConversation {
-            request: ParsedRequest {
-                method: "GET".to_string(),
-                path: "/first".to_string(),
-                version: "HTTP/1.1".to_string(),
-                headers: vec![],
-                body: vec![],
-                header_size: 0,
+        converter.add_conversation(
+            HttpConversation {
+                request: ParsedRequest {
+                    method: "GET".to_string(),
+                    path: "/first".to_string(),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![],
+                    body: vec![],
+                    header_size: 0,
+                },
+                response: None,
+                src_ip: "127.0.0.1".to_string(),
+                dst_ip: "127.0.0.1".to_string(),
+                src_port: 12346,
+                dst_port: 80,
+                request_timestamps: vec![earlier],
+                response_timestamps: vec![],
             },
-            response: None,
-            src_ip: "127.0.0.1".to_string(),
-            dst_ip: "127.0.0.1".to_string(),
-            src_port: 12346,
-            dst_port: 80,
-            request_timestamps: vec![earlier],
-            response_timestamps: vec![],
-        });
+            "http",
+            None,
+            0,
+        );
 
-        converter.conversations.push(HttpConversation {
-            request: ParsedRequest {
-                method: "GET".to_string(),
-                path: "/third".to_string(),
-                version: "HTTP/1.1".to_string(),
-                headers: vec![],
-                body: vec![],
-                header_size: 0,
+        converter.add_conversation(
+            HttpConversation {
+                request: ParsedRequest {
+                    method: "GET".to_string(),
+                    path: "/third".to_string(),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![],
+                    body: vec![],
+                    header_size: 0,
+                },
+                response: None,
+                src_ip: "127.0.0.1".to_string(),
+                dst_ip: "127.0.0.1".to_string(),
+                src_port: 12347,
+                dst_port: 80,
+                request_timestamps: vec![later],
+                response_timestamps: vec![],
             },
-            response: None,
-            src_ip: "127.0.0.1".to_string(),
-            dst_ip: "127.0.0.1".to_string(),
-            src_port: 12347,
-            dst_port: 80,
-            request_timestamps: vec![later],
-            response_timestamps: vec![],
-        });
+            "http",
+            None,
+            0,
+        );
 
         let har = converter.to_har();
 

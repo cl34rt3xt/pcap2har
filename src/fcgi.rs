@@ -147,7 +147,8 @@ fn parse_params(data: &[u8], params: &mut HashMap<String, String>) {
         }
 
         let name = String::from_utf8_lossy(&data[pos..pos + name_len]).to_string();
-        let value = String::from_utf8_lossy(&data[pos + name_len..pos + name_len + value_len]).to_string();
+        let value =
+            String::from_utf8_lossy(&data[pos + name_len..pos + name_len + value_len]).to_string();
 
         params.insert(name, value);
         cursor.set_position((pos + name_len + value_len) as u64);
@@ -176,8 +177,22 @@ fn read_length(cursor: &mut Cursor<&[u8]>) -> Option<usize> {
 }
 
 pub fn fcgi_to_http_request(fcgi: &FcgiRequest) -> Option<crate::http::ParsedRequest> {
-    let method = fcgi.params.get("REQUEST_METHOD")?.clone();
-    let path = fcgi.params.get("REQUEST_URI").cloned().unwrap_or_else(|| "/".to_string());
+    fcgi_to_http_request_bounded(fcgi, usize::MAX).0
+}
+
+/// Converts a FastCGI request and reports whether its body was truncated.
+pub fn fcgi_to_http_request_bounded(
+    fcgi: &FcgiRequest,
+    max_body_bytes: usize,
+) -> (Option<crate::http::ParsedRequest>, bool) {
+    let Some(method) = fcgi.params.get("REQUEST_METHOD").cloned() else {
+        return (None, false);
+    };
+    let path = fcgi
+        .params
+        .get("REQUEST_URI")
+        .cloned()
+        .unwrap_or_else(|| "/".to_string());
 
     let mut headers = Vec::new();
 
@@ -186,15 +201,21 @@ pub fn fcgi_to_http_request(fcgi: &FcgiRequest) -> Option<crate::http::ParsedReq
             headers.push((header_name, value.clone()));
         }
     }
+    headers.sort();
 
-    Some(crate::http::ParsedRequest {
-        method,
-        path,
-        version: String::new(), // FastCGI doesn't preserve HTTP version
-        headers,
-        body: fcgi.stdin.clone(),
-        header_size: 0,
-    })
+    let (body, body_limit_exceeded) = crate::http::copy_body_bounded(&fcgi.stdin, max_body_bytes);
+
+    (
+        Some(crate::http::ParsedRequest {
+            method,
+            path,
+            version: String::new(), // FastCGI doesn't preserve HTTP version
+            headers,
+            body,
+            header_size: 0,
+        }),
+        body_limit_exceeded,
+    )
 }
 
 fn cgi_to_header_name(cgi_name: &str) -> Option<String> {
@@ -221,11 +242,20 @@ fn cgi_to_header_name(cgi_name: &str) -> Option<String> {
 }
 
 pub fn fcgi_to_http_response(fcgi: &FcgiResponse) -> Option<crate::http::ParsedResponse> {
+    fcgi_to_http_response_bounded(fcgi, usize::MAX).0
+}
+
+/// Converts a FastCGI response and reports whether its decoded body was truncated.
+pub fn fcgi_to_http_response_bounded(
+    fcgi: &FcgiResponse,
+    max_body_bytes: usize,
+) -> (Option<crate::http::ParsedResponse>, bool) {
     if fcgi.stdout.is_empty() {
-        return None;
+        return (None, false);
     }
 
-    let separator_pos = fcgi.stdout
+    let separator_pos = fcgi
+        .stdout
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|p| p + 4)
@@ -237,8 +267,8 @@ pub fn fcgi_to_http_response(fcgi: &FcgiResponse) -> Option<crate::http::ParsedR
         });
 
     let (header_data, body) = match separator_pos {
-        Some(pos) => (&fcgi.stdout[..pos], fcgi.stdout[pos..].to_vec()),
-        None => (fcgi.stdout.as_slice(), Vec::new()),
+        Some(pos) => (&fcgi.stdout[..pos], &fcgi.stdout[pos..]),
+        None => (fcgi.stdout.as_slice(), &[][..]),
     };
 
     // Parse headers
@@ -272,27 +302,84 @@ pub fn fcgi_to_http_response(fcgi: &FcgiResponse) -> Option<crate::http::ParsedR
         }
     }
 
-    let is_gzip = headers
-        .iter()
-        .any(|(k, v)| k.to_lowercase() == "content-encoding" && v.to_lowercase().contains("gzip"));
+    let (body, body_limit_exceeded) =
+        crate::http::decode_body_bounded(body, &headers, max_body_bytes);
 
-    let body = if is_gzip {
-        use flate2::read::GzDecoder;
-        use std::io::Read;
-        let mut decoder = GzDecoder::new(body.as_slice());
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed).unwrap_or(0);
-        decompressed
-    } else {
-        body
-    };
+    (
+        Some(crate::http::ParsedResponse {
+            status,
+            reason: status_text,
+            version: "HTTP/1.0".to_string(),
+            headers,
+            body,
+            header_size: header_data.len(),
+        }),
+        body_limit_exceeded,
+    )
+}
 
-    Some(crate::http::ParsedResponse {
-        status,
-        reason: status_text,
-        version: "HTTP/1.0".to_string(),
-        headers,
-        body,
-        header_size: header_data.len(),
-    })
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+
+    #[test]
+    fn request_headers_are_sorted_independently_of_hashmap_iteration() {
+        let mut request = FcgiRequest::default();
+        for (name, value) in [
+            ("HTTP_X_ZULU", "z"),
+            ("HTTP_ACCEPT", "text/plain"),
+            ("CONTENT_TYPE", "application/json"),
+            ("HTTP_X_ALPHA", "a"),
+            ("CONTENT_LENGTH", "2"),
+            ("HTTP_USER_AGENT", "fixture"),
+            ("REQUEST_METHOD", "POST"),
+            ("REQUEST_URI", "/deterministic"),
+        ] {
+            request.params.insert(name.to_string(), value.to_string());
+        }
+
+        let parsed = fcgi_to_http_request(&request).unwrap();
+
+        assert_eq!(
+            parsed.headers,
+            vec![
+                ("Accept".to_string(), "text/plain".to_string()),
+                ("Content-Length".to_string(), "2".to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("User-Agent".to_string(), "fixture".to_string()),
+                ("X-Alpha".to_string(), "a".to_string()),
+                ("X-Zulu".to_string(), "z".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn gzip_response_body_is_bounded() {
+        let mut state = 0x1234_5678_u32;
+        let original: Vec<_> = (0..4 << 10)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() > 256);
+        let mut stdout = b"Content-Type: text/plain\r\nContent-Encoding: gzip\r\n\r\n".to_vec();
+        stdout.extend_from_slice(&compressed);
+        let response = FcgiResponse {
+            stdout,
+            stderr: Vec::new(),
+        };
+
+        let (parsed, limited) = fcgi_to_http_response_bounded(&response, 256);
+
+        assert!(limited);
+        assert_eq!(parsed.unwrap().body, original[..256]);
+    }
 }

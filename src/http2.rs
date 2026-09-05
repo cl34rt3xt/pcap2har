@@ -182,11 +182,21 @@ pub fn parse_http2_stream(
                     .extend_from_slice(payload);
 
                 if is_client {
-                    if let Some(req) = requests.iter_mut().find(|r| r.stream_id == frame.stream_id) {
-                        req.body = stream_data.get(&frame.stream_id).cloned().unwrap_or_default();
+                    if let Some(req) = requests.iter_mut().find(|r| r.stream_id == frame.stream_id)
+                    {
+                        req.body = stream_data
+                            .get(&frame.stream_id)
+                            .cloned()
+                            .unwrap_or_default();
                     }
-                } else if let Some(resp) = responses.iter_mut().find(|r| r.stream_id == frame.stream_id) {
-                    resp.body = stream_data.get(&frame.stream_id).cloned().unwrap_or_default();
+                } else if let Some(resp) = responses
+                    .iter_mut()
+                    .find(|r| r.stream_id == frame.stream_id)
+                {
+                    resp.body = stream_data
+                        .get(&frame.stream_id)
+                        .cloned()
+                        .unwrap_or_default();
                 }
             }
             FRAME_CONTINUATION => {

@@ -1,3 +1,5 @@
+pub use crate::secrets::{ClientSecrets, TlsSecrets, TrafficSecrets};
+
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes128Gcm, Aes256Gcm, Nonce,
@@ -6,7 +8,6 @@ use hkdf::Hkdf;
 use hmac::Mac;
 use rustls::CipherSuite;
 use sha2::{Sha256, Sha384};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CipherSuiteInfo {
@@ -44,84 +45,6 @@ impl CipherSuiteInfo {
     pub fn uses_sha384(&self) -> bool {
         let name = format!("{:?}", self.suite);
         name.contains("SHA384")
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TlsSecrets {
-    pub client_randoms: HashMap<String, ClientSecrets>,
-    pub traffic_secrets: HashMap<String, TrafficSecrets>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ClientSecrets {
-    pub master_secret: Option<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct TrafficSecrets {
-    pub client_handshake_traffic_secret: Option<Vec<u8>>,
-    pub server_handshake_traffic_secret: Option<Vec<u8>>,
-    pub client_traffic_secret_0: Option<Vec<u8>>,
-    pub server_traffic_secret_0: Option<Vec<u8>>,
-    pub exporter_secret: Option<Vec<u8>>,
-}
-
-impl TlsSecrets {
-    pub fn new() -> Self {
-        TlsSecrets {
-            client_randoms: HashMap::new(),
-            traffic_secrets: HashMap::new(),
-        }
-    }
-
-    pub fn parse_keylog(&mut self, data: &[u8]) {
-        let text = String::from_utf8_lossy(data);
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 3 {
-                continue;
-            }
-
-            let label = parts[0];
-            let client_random = parts[1].to_lowercase();
-            let Ok(secret) = hex::decode(parts[2]) else {
-                continue;
-            };
-
-            match label {
-                "CLIENT_RANDOM" => {
-                    self.client_randoms.entry(client_random).or_default().master_secret = Some(secret);
-                }
-                "CLIENT_HANDSHAKE_TRAFFIC_SECRET" => {
-                    self.traffic_secrets.entry(client_random).or_default().client_handshake_traffic_secret = Some(secret);
-                }
-                "SERVER_HANDSHAKE_TRAFFIC_SECRET" => {
-                    self.traffic_secrets.entry(client_random).or_default().server_handshake_traffic_secret = Some(secret);
-                }
-                "CLIENT_TRAFFIC_SECRET_0" => {
-                    self.traffic_secrets.entry(client_random).or_default().client_traffic_secret_0 = Some(secret);
-                }
-                "SERVER_TRAFFIC_SECRET_0" => {
-                    self.traffic_secrets.entry(client_random).or_default().server_traffic_secret_0 = Some(secret);
-                }
-                "EXPORTER_SECRET" => {
-                    self.traffic_secrets.entry(client_random).or_default().exporter_secret = Some(secret);
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-impl Default for TlsSecrets {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -196,7 +119,8 @@ pub fn decrypt_tls13_record_full(
     let nonce = Nonce::from_slice(&nonce);
     let aad = [
         23u8,
-        0x03, 0x03,
+        0x03,
+        0x03,
         (record_length >> 8) as u8,
         (record_length & 0xff) as u8,
     ];
@@ -207,9 +131,15 @@ pub fn decrypt_tls13_record_full(
     };
 
     let result = if key_len == 32 {
-        Aes256Gcm::new_from_slice(&key).ok()?.decrypt(nonce, payload).ok()?
+        Aes256Gcm::new_from_slice(&key)
+            .ok()?
+            .decrypt(nonce, payload)
+            .ok()?
     } else {
-        Aes128Gcm::new_from_slice(&key).ok()?.decrypt(nonce, payload).ok()?
+        Aes128Gcm::new_from_slice(&key)
+            .ok()?
+            .decrypt(nonce, payload)
+            .ok()?
     };
 
     if result.is_empty() {
@@ -417,8 +347,14 @@ pub fn decrypt_tls12_record(
     };
 
     if key.len() == 32 {
-        Aes256Gcm::new_from_slice(key).ok()?.decrypt(nonce, payload).ok()
+        Aes256Gcm::new_from_slice(key)
+            .ok()?
+            .decrypt(nonce, payload)
+            .ok()
     } else {
-        Aes128Gcm::new_from_slice(key).ok()?.decrypt(nonce, payload).ok()
+        Aes128Gcm::new_from_slice(key)
+            .ok()?
+            .decrypt(nonce, payload)
+            .ok()
     }
 }

@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use httparse::{Request, Response, Status, EMPTY_HEADER};
+use std::borrow::Cow;
 use std::io::Read;
 use thiserror::Error;
 
@@ -33,6 +34,14 @@ pub struct ParsedResponse {
 }
 
 pub fn parse_request(data: &[u8]) -> Result<Option<ParsedRequest>, HttpError> {
+    parse_request_bounded(data, usize::MAX).map(|(request, _)| request)
+}
+
+/// Parses one request and reports whether its body exceeded `max_body_bytes`.
+pub fn parse_request_bounded(
+    data: &[u8],
+    max_body_bytes: usize,
+) -> Result<(Option<ParsedRequest>, bool), HttpError> {
     let mut headers = [EMPTY_HEADER; 64];
     let mut req = Request::new(&mut headers);
 
@@ -53,16 +62,20 @@ pub fn parse_request(data: &[u8]) -> Result<Option<ParsedRequest>, HttpError> {
                 })
                 .collect();
 
-            let body = extract_body(&data[header_len..], &headers);
+            let (body, _, body_limit_exceeded) =
+                extract_body_bounded(&data[header_len..], &headers, max_body_bytes);
 
-            Ok(Some(ParsedRequest {
-                method,
-                path,
-                version,
-                headers,
-                body,
-                header_size: header_len,
-            }))
+            Ok((
+                Some(ParsedRequest {
+                    method,
+                    path,
+                    version,
+                    headers,
+                    body,
+                    header_size: header_len,
+                }),
+                body_limit_exceeded,
+            ))
         }
         Ok(Status::Partial) => Err(HttpError::Incomplete),
         Err(e) => Err(HttpError::Parse(e.to_string())),
@@ -71,8 +84,19 @@ pub fn parse_request(data: &[u8]) -> Result<Option<ParsedRequest>, HttpError> {
 
 /// Parse multiple HTTP requests from a single data stream (HTTP/1.1 Keep-Alive)
 pub fn parse_all_requests(data: &[u8]) -> Vec<ParsedRequest> {
+    parse_all_requests_bounded(data, usize::MAX, usize::MAX).0
+}
+
+/// Parses keep-alive requests with independent per-body and aggregate body limits.
+pub fn parse_all_requests_bounded(
+    data: &[u8],
+    max_body_bytes: usize,
+    max_total_body_bytes: usize,
+) -> (Vec<ParsedRequest>, bool) {
     let mut requests = Vec::new();
     let mut offset = 0;
+    let mut body_limit_exceeded = false;
+    let mut remaining_body_bytes = max_total_body_bytes;
 
     while offset < data.len() {
         let remaining = &data[offset..];
@@ -97,7 +121,13 @@ pub fn parse_all_requests(data: &[u8]) -> Vec<ParsedRequest> {
                     })
                     .collect();
 
-                let (body, body_len) = extract_body_with_length(&remaining[header_len..], &headers);
+                let (body, body_len, limited) = extract_body_bounded(
+                    &remaining[header_len..],
+                    &headers,
+                    max_body_bytes.min(remaining_body_bytes),
+                );
+                remaining_body_bytes = remaining_body_bytes.saturating_sub(body.len());
+                body_limit_exceeded |= limited;
 
                 requests.push(ParsedRequest {
                     method,
@@ -114,10 +144,18 @@ pub fn parse_all_requests(data: &[u8]) -> Vec<ParsedRequest> {
         }
     }
 
-    requests
+    (requests, body_limit_exceeded)
 }
 
 pub fn parse_response(data: &[u8]) -> Result<Option<ParsedResponse>, HttpError> {
+    parse_response_bounded(data, usize::MAX).map(|(response, _)| response)
+}
+
+/// Parses one response and reports whether its decoded body exceeded the limit.
+pub fn parse_response_bounded(
+    data: &[u8],
+    max_body_bytes: usize,
+) -> Result<(Option<ParsedResponse>, bool), HttpError> {
     let mut headers = [EMPTY_HEADER; 64];
     let mut resp = Response::new(&mut headers);
 
@@ -138,16 +176,20 @@ pub fn parse_response(data: &[u8]) -> Result<Option<ParsedResponse>, HttpError> 
                 })
                 .collect();
 
-            let body = extract_body(&data[header_len..], &headers);
+            let (body, _, body_limit_exceeded) =
+                extract_body_bounded(&data[header_len..], &headers, max_body_bytes);
 
-            Ok(Some(ParsedResponse {
-                status,
-                reason,
-                version,
-                headers,
-                body,
-                header_size: header_len,
-            }))
+            Ok((
+                Some(ParsedResponse {
+                    status,
+                    reason,
+                    version,
+                    headers,
+                    body,
+                    header_size: header_len,
+                }),
+                body_limit_exceeded,
+            ))
         }
         Ok(Status::Partial) => Err(HttpError::Incomplete),
         Err(e) => Err(HttpError::Parse(e.to_string())),
@@ -156,8 +198,19 @@ pub fn parse_response(data: &[u8]) -> Result<Option<ParsedResponse>, HttpError> 
 
 /// Parse multiple HTTP responses from a single data stream (HTTP/1.1 Keep-Alive)
 pub fn parse_all_responses(data: &[u8]) -> Vec<ParsedResponse> {
+    parse_all_responses_bounded(data, usize::MAX, usize::MAX).0
+}
+
+/// Parses keep-alive responses with independent per-body and aggregate body limits.
+pub fn parse_all_responses_bounded(
+    data: &[u8],
+    max_body_bytes: usize,
+    max_total_body_bytes: usize,
+) -> (Vec<ParsedResponse>, bool) {
     let mut responses = Vec::new();
     let mut offset = 0;
+    let mut body_limit_exceeded = false;
+    let mut remaining_body_bytes = max_total_body_bytes;
 
     while offset < data.len() {
         let remaining = &data[offset..];
@@ -182,7 +235,13 @@ pub fn parse_all_responses(data: &[u8]) -> Vec<ParsedResponse> {
                     })
                     .collect();
 
-                let (body, body_len) = extract_body_with_length(&remaining[header_len..], &headers);
+                let (body, body_len, limited) = extract_body_bounded(
+                    &remaining[header_len..],
+                    &headers,
+                    max_body_bytes.min(remaining_body_bytes),
+                );
+                remaining_body_bytes = remaining_body_bytes.saturating_sub(body.len());
+                body_limit_exceeded |= limited;
 
                 responses.push(ParsedResponse {
                     status,
@@ -199,46 +258,44 @@ pub fn parse_all_responses(data: &[u8]) -> Vec<ParsedResponse> {
         }
     }
 
-    responses
+    (responses, body_limit_exceeded)
 }
 
-fn extract_body(data: &[u8], headers: &[(String, String)]) -> Vec<u8> {
-    let (body, _) = extract_body_with_length(data, headers);
-    body
-}
-
+#[cfg(test)]
 fn extract_body_with_length(data: &[u8], headers: &[(String, String)]) -> (Vec<u8>, usize) {
+    let (body, consumed, _) = extract_body_bounded(data, headers, usize::MAX);
+    (body, consumed)
+}
+
+fn extract_body_bounded(
+    data: &[u8],
+    headers: &[(String, String)],
+    max_body_bytes: usize,
+) -> (Vec<u8>, usize, bool) {
     let content_length = headers
         .iter()
         .find(|(k, _)| k.to_lowercase() == "content-length")
         .and_then(|(_, v)| v.parse::<usize>().ok());
 
-    let is_chunked = headers
-        .iter()
-        .any(|(k, v)| k.to_lowercase() == "transfer-encoding" && v.to_lowercase().contains("chunked"));
+    let is_chunked = headers.iter().any(|(k, v)| {
+        k.to_lowercase() == "transfer-encoding" && v.to_lowercase().contains("chunked")
+    });
 
-    let (body, consumed) = if is_chunked {
+    let (encoded_body, consumed) = if is_chunked {
         let body = decode_chunked(data);
         let consumed = find_chunked_end(data);
-        (body, consumed)
+        (Cow::Owned(body), consumed)
     } else if let Some(len) = content_length {
         let actual_len = len.min(data.len());
-        (data[..actual_len].to_vec(), actual_len)
+        (Cow::Borrowed(&data[..actual_len]), actual_len)
     } else {
-        (data.to_vec(), data.len())
+        (Cow::Borrowed(data), data.len())
     };
 
-    let is_gzip = headers
-        .iter()
-        .any(|(k, v)| k.to_lowercase() == "content-encoding" && v.to_lowercase().contains("gzip"));
+    let (body, body_limit_exceeded) =
+        decode_body_bounded(encoded_body.as_ref(), headers, max_body_bytes);
 
-    let body = if is_gzip {
-        decompress_gzip(&body).unwrap_or(body)
-    } else {
-        body
-    };
-
-    (body, consumed)
+    (body, consumed, body_limit_exceeded)
 }
 
 fn find_chunked_end(data: &[u8]) -> usize {
@@ -262,8 +319,13 @@ fn find_chunked_end(data: &[u8]) -> usize {
         }
 
         let chunk_start = line_end + 2;
-        let chunk_end = chunk_start + size;
-        pos = chunk_end + 2;
+        let Some(chunk_end) = chunk_start.checked_add(size) else {
+            return data.len();
+        };
+        let Some(next) = chunk_end.checked_add(2) else {
+            return data.len();
+        };
+        pos = next;
     }
 
     data.len()
@@ -291,23 +353,68 @@ fn decode_chunked(data: &[u8]) -> Vec<u8> {
         }
 
         let chunk_start = line_end + 2;
-        let chunk_end = chunk_start + size;
+        let Some(chunk_end) = chunk_start.checked_add(size) else {
+            break;
+        };
 
         if chunk_end <= data.len() {
             result.extend_from_slice(&data[chunk_start..chunk_end]);
         }
 
-        pos = chunk_end + 2;
+        let Some(next) = chunk_end.checked_add(2) else {
+            break;
+        };
+        pos = next;
     }
 
     result
 }
 
-fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+fn decompress_gzip_bounded(
+    data: &[u8],
+    max_body_bytes: usize,
+) -> Result<(Vec<u8>, bool), std::io::Error> {
     let mut decoder = GzDecoder::new(data);
-    let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed)?;
-    Ok(decompressed)
+    let mut decompressed = Vec::with_capacity(data.len().min(max_body_bytes));
+    let mut buffer = [0_u8; 8 << 10];
+
+    loop {
+        let remaining = max_body_bytes.saturating_sub(decompressed.len());
+        let read_limit = if remaining == 0 {
+            1
+        } else {
+            remaining.min(buffer.len())
+        };
+        let read = decoder.read(&mut buffer[..read_limit])?;
+        if read == 0 {
+            return Ok((decompressed, false));
+        }
+        if remaining == 0 {
+            return Ok((decompressed, true));
+        }
+        decompressed.extend_from_slice(&buffer[..read]);
+    }
+}
+
+pub(crate) fn copy_body_bounded(data: &[u8], max_body_bytes: usize) -> (Vec<u8>, bool) {
+    let copied = data.len().min(max_body_bytes);
+    (data[..copied].to_vec(), copied < data.len())
+}
+
+pub(crate) fn decode_body_bounded(
+    data: &[u8],
+    headers: &[(String, String)],
+    max_body_bytes: usize,
+) -> (Vec<u8>, bool) {
+    let is_gzip = headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-encoding") && value.to_ascii_lowercase().contains("gzip")
+    });
+    if is_gzip {
+        decompress_gzip_bounded(data, max_body_bytes)
+            .unwrap_or_else(|_| copy_body_bounded(data, max_body_bytes))
+    } else {
+        copy_body_bounded(data, max_body_bytes)
+    }
 }
 
 #[derive(Debug)]
@@ -327,7 +434,7 @@ impl HttpConversation {
         self.request_timestamps
             .first()
             .copied()
-            .unwrap_or_else(Utc::now)
+            .unwrap_or_else(|| DateTime::<Utc>::from_timestamp_nanos(0))
     }
 
     pub fn duration_ns(&self) -> i64 {
@@ -347,6 +454,20 @@ impl HttpConversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+
+    fn incompressible_fixture(len: usize) -> Vec<u8> {
+        let mut state = 0x1234_5678_u32;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
 
     #[test]
     fn test_parse_simple_request() {
@@ -392,8 +513,10 @@ mod tests {
         assert_eq!(req.method, "POST");
         assert_eq!(req.path, "/api");
         assert_eq!(req.body, b"{\"key\":\"val\"}");
-        
-        let has_content_type = req.headers.iter()
+
+        let has_content_type = req
+            .headers
+            .iter()
             .any(|(k, v)| k == "Content-Type" && v == "application/json");
         assert!(has_content_type);
     }
@@ -414,11 +537,33 @@ mod tests {
         assert_eq!(resp.reason, "OK");
         assert_eq!(resp.version, "HTTP/1.1");
         assert_eq!(resp.body, b"{}");
-        
-        let content_type = resp.headers.iter()
+
+        let content_type = resp
+            .headers
+            .iter()
             .find(|(k, _)| k == "Content-Type")
             .map(|(_, v)| v.as_str());
         assert_eq!(content_type, Some("application/json"));
+    }
+
+    #[test]
+    fn gzip_limit_returns_decoded_prefix_when_encoded_input_exceeds_limit() {
+        let original = incompressible_fixture(4 << 10);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() > 256);
+        let mut message = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            compressed.len()
+        )
+        .into_bytes();
+        message.extend_from_slice(&compressed);
+
+        let (parsed, limited) = parse_response_bounded(&message, 256).unwrap();
+
+        assert!(limited);
+        assert_eq!(parsed.unwrap().body, original[..256]);
     }
 
     #[test]
@@ -491,7 +636,7 @@ mod tests {
         assert!(result.is_some());
         let req = result.unwrap();
         assert_eq!(req.headers.len(), 4);
-        
+
         let has_host = req.headers.iter().any(|(k, _)| k == "Host");
         let has_auth = req.headers.iter().any(|(k, _)| k == "Authorization");
         assert!(has_host);
@@ -562,12 +707,35 @@ mod tests {
     }
 
     #[test]
+    fn http_conversation_without_timestamps_uses_epoch() {
+        let conv = HttpConversation {
+            request: ParsedRequest {
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                version: "HTTP/1.1".to_string(),
+                headers: vec![],
+                body: vec![],
+                header_size: 0,
+            },
+            response: None,
+            src_ip: "127.0.0.1".to_string(),
+            dst_ip: "127.0.0.1".to_string(),
+            src_port: 12345,
+            dst_port: 80,
+            request_timestamps: vec![],
+            response_timestamps: vec![],
+        };
+
+        assert_eq!(conv.start_time(), DateTime::<Utc>::from_timestamp_nanos(0));
+    }
+
+    #[test]
     fn test_http_conversation_duration() {
         use chrono::Duration;
-        
+
         let start = Utc::now();
         let end = start + Duration::milliseconds(100);
-        
+
         let conv = HttpConversation {
             request: ParsedRequest {
                 method: "GET".to_string(),
@@ -587,7 +755,7 @@ mod tests {
         };
 
         let duration_ns = conv.duration_ns();
-        assert!(duration_ns >= 99_000_000 && duration_ns <= 101_000_000);
+        assert!((99_000_000..=101_000_000).contains(&duration_ns));
     }
 
     #[test]
@@ -603,8 +771,10 @@ mod tests {
         let resp = result.unwrap();
         assert_eq!(resp.status, 301);
         assert_eq!(resp.reason, "Moved Permanently");
-        
-        let location = resp.headers.iter()
+
+        let location = resp
+            .headers
+            .iter()
             .find(|(k, _)| k == "Location")
             .map(|(_, v)| v.as_str());
         assert_eq!(location, Some("https://example.com/new-location"));
@@ -612,9 +782,7 @@ mod tests {
 
     #[test]
     fn test_extract_body_with_content_length_larger_than_data() {
-        let headers = vec![
-            ("Content-Length".to_string(), "1000".to_string()),
-        ];
+        let headers = vec![("Content-Length".to_string(), "1000".to_string())];
         let data = b"short body";
 
         let (body, consumed) = extract_body_with_length(data, &headers);
@@ -637,8 +805,10 @@ mod tests {
         let req = result.unwrap();
         assert_eq!(req.method, "POST");
         assert_eq!(req.body, b"name=John&email=j%40e.com");
-        
-        let content_type = req.headers.iter()
+
+        let content_type = req
+            .headers
+            .iter()
             .find(|(k, _)| k == "Content-Type")
             .map(|(_, v)| v.as_str());
         assert_eq!(content_type, Some("application/x-www-form-urlencoded"));

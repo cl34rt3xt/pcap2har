@@ -6,19 +6,22 @@ A high-performance PCAP to HAR converter written in Rust, designed to analyze ne
 
 ## Overview
 
-This tool converts network packet capture files (PCAP) into HAR (HTTP Archive) JSON format, making it easier to analyze HTTP/HTTPS traffic. It supports multiple protocols including HTTP/1.x, HTTP/2, HTTPS (with TLS decryption), and FastCGI, making it particularly useful for web development, API debugging, and network traffic analysis.
+This tool converts PCAP and PCAPNG captures into HAR JSON. It supports HTTP/1.x, HTTP/2, HTTP/3 over QUIC, TLS decryption, and FastCGI without invoking an external protocol dissector at runtime.
 
 ## Features
 
 - **Multiple Protocol Support**
   - HTTP/1.0 and HTTP/1.1
   - HTTP/2 (with HPACK header decompression)
+  - HTTP/3 with static and dynamic QPACK
+  - QUIC v1 and v2 with AES-GCM and ChaCha20-Poly1305 packet protection
   - HTTPS with TLS 1.2 and TLS 1.3 decryption
   - FastCGI protocol parsing
 
 - **Advanced Capabilities**
   - TCP stream reassembly for accurate conversation tracking
-  - TLS traffic decryption using keylog files
+  - Bounded QUIC CRYPTO/STREAM reassembly, CID migration, Retry, and key updates
+  - TLS traffic decryption using NSS keylog sidecars or pcapng DSB records
   - Automatic request-response pairing
   - Multiple concurrent requests handling
   - Gzip/deflate content decompression
@@ -33,8 +36,9 @@ This tool converts network packet capture files (PCAP) into HAR (HTTP Archive) J
 
 ### Prerequisites
 
-- Rust 1.70 or higher
-- libpcap (Linux/macOS) or WinPcap/Npcap (Windows)
+- Rust 1.88 or higher
+
+The converter reads save files with a pure Rust parser and does not require libpcap, tshark, or another runtime dissector.
 
 ### Building from Source
 
@@ -104,6 +108,9 @@ eCapture can capture HTTPS traffic and automatically decrypt TLS communications,
 # Capture HTTPS traffic and save as pcapng with decrypted content
 sudo ecapture tls -m pcapng -i eth0 --pcapfile=capture.pcapng "tcp port 443"
 
+# Include UDP when capturing QUIC traffic
+sudo ecapture tls -m pcapng -i eth0 --pcapfile=quic.pcapng "udp port 443"
+
 # Capture traffic from all interfaces
 sudo ecapture tls -m pcapng -i any --pcapfile=capture.pcapng
 
@@ -113,10 +120,13 @@ sudo ecapture tls -m pcapng -i any --pcapfile=capture.pcapng "tcp port 80"
 
 #### Step 2: Convert to HAR
 
-Since eCapture outputs decrypted plaintext directly in the PCAP file, you can convert it immediately without any additional configuration:
+For QUIC, capture UDP datagrams and NSS secrets in a pcapng Decryption Secrets Block, or provide the NSS key log as a sidecar. The converter performs QUIC and HTTP/3 decoding itself:
 
 ```bash
 pcap2har capture.pcapng -o output.har
+
+# With a sidecar key log
+pcap2har capture.pcapng --keylog sslkeys.log -o output.har
 ```
 
 ## Viewing HAR Files
@@ -165,6 +175,8 @@ The project is organized into several modules:
 - `tcp.rs`: TCP stream reassembly and packet ordering
 - `http.rs`: HTTP/1.x protocol parsing
 - `http2.rs`: HTTP/2 frame parsing and HPACK decompression
+- `quic/`: passive QUIC v1/v2 packet protection and stream reassembly
+- `http3/`: HTTP/3 routing, QPACK, and message assembly
 - `tls.rs`: TLS record parsing and decryption
 - `fcgi.rs`: FastCGI protocol parsing
 - `har.rs`: HAR format data structures
@@ -193,6 +205,12 @@ The project is organized into several modules:
 - Keylog file support
 - Multiple cipher suites
 
+### QUIC/HTTP/3
+- QUIC v1 and v2 Initial, Handshake, 0-RTT, and 1-RTT packets
+- AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305
+- Retry integrity, connection IDs, migration, packet-number spaces, and key updates
+- HTTP/3 request/response bodies and static/dynamic QPACK headers
+
 ### FastCGI
 - Request parsing
 - Response parsing
@@ -202,19 +220,21 @@ The project is organized into several modules:
 
 - **TLS Decryption**: Requires keylog files; Perfect Forward Secrecy (PFS) connections cannot be decrypted without keylog
 - **WebSocket**: WebSocket frame parsing is not yet implemented
-- **QUIC/HTTP3**: Not currently supported
 - **Fragmented Packets**: Some edge cases in TCP reassembly may not be handled perfectly
-- **Memory Usage**: Large PCAP files are loaded into memory; very large files (>1GB) may require significant RAM
+- **IP Fragments**: Fragmented IPv4/IPv6 datagrams are rejected with a diagnostic
+- **Decryption Secrets**: Encrypted TLS and QUIC application data requires matching NSS secrets
 
 ## Dependencies
 
 This project uses the following major crates:
 
-- [pcap](https://crates.io/crates/pcap) - PCAP file parsing
+- [pcap-parser](https://crates.io/crates/pcap-parser) - streaming PCAP/PCAPNG parsing
 - [etherparse](https://crates.io/crates/etherparse) - Network protocol parsing
 - [httparse](https://crates.io/crates/httparse) - HTTP header parsing
 - [serde_json](https://crates.io/crates/serde_json) - JSON serialization
 - [rustls](https://crates.io/crates/rustls) - TLS protocol support
+- [RustCrypto](https://github.com/RustCrypto) - native QUIC packet protection
+- [compcol](https://crates.io/crates/compcol) - QPACK decoding
 - [clap](https://crates.io/crates/clap) - Command-line argument parsing
 
 ## Contributing
@@ -250,4 +270,3 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - [eCapture](https://github.com/gojue/ecapture): Capture SSL/TLS traffic using eBPF
 - [mitmproxy](https://mitmproxy.org/): Interactive HTTPS proxy
 - [Reqable](https://reqable.com/): API debugging and HTTP traffic analysis tool
-

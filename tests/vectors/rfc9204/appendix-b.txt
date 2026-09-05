@@ -1,0 +1,11 @@
+# RFC 9204 Appendix B vectors used by tests/http3_qpack.rs.
+# Values after the colon are hexadecimal octets; quoted values are raw bytes.
+
+b1-field-section: 00 00 51 0b "/index.html"
+b2-encoder: 3f bd 01 c0 0f "www.example.com" c1 0c "/sample/path"
+b2-field-section: 03 81 10 11
+b3-encoder: 4a "custom-key" 0c "custom-value"
+b4-encoder: 02
+b4-field-section: 05 00 80 c1 81
+b5-encoder: 81 0d "custom-value2"
+b5-field-section: 06 00 80

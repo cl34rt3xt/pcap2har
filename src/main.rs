@@ -1,8 +1,11 @@
-use clap::Parser;
-use pcap2har::convert_pcap_to_har;
+use clap::{error::ErrorKind, Parser};
+use pcap2har::{
+    convert_capture, ConversionOptions, ConversionReport, DecodeLimits, DiagnosticCode,
+    DiagnosticScope, Har, Severity,
+};
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 #[derive(Parser)]
@@ -10,47 +13,172 @@ use std::process;
 #[command(about = "Convert PCAP files to HAR format")]
 #[command(version)]
 struct Cli {
-    /// Input PCAP file
+    /// Input PCAP or PCAPNG file
     #[arg(value_name = "PCAP_FILE")]
     input: PathBuf,
 
     /// Output HAR file (stdout if not specified)
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
+
+    /// NSS key log sidecar file
+    #[arg(long, value_name = "FILE")]
+    keylog: Option<PathBuf>,
+
+    /// Return exit code 2 when partial conversion diagnostics are present
+    #[arg(long)]
+    strict: bool,
+
+    /// Maximum buffered payload budget per conversion stage in MiB
+    #[arg(long, value_name = "MIB", default_value = "256")]
+    max_memory_mib: String,
 }
 
 fn main() {
-    let cli = Cli::parse();
-
-    let har = match convert_pcap_to_har(cli.input.to_str().unwrap_or_default()) {
-        Ok(har) => har,
-        Err(e) => {
-            eprintln!("Error: {}", e);
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let informational = matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            );
+            let _ = error.print();
+            if informational {
+                return;
+            }
             process::exit(1);
         }
     };
-
-    let json = match serde_json::to_string_pretty(&har) {
-        Ok(json) => json,
-        Err(e) => {
-            eprintln!("Error serializing HAR: {}", e);
-            process::exit(1);
+    let exit_code = match run(cli) {
+        Ok(exit_code) => exit_code,
+        Err(message) => {
+            eprintln!("{message}");
+            1
         }
     };
+    if exit_code != 0 {
+        process::exit(exit_code);
+    }
+}
 
-    let result: Result<(), String> = match &cli.output {
+fn run(cli: Cli) -> Result<i32, String> {
+    let max_memory_bytes = parse_memory_bytes(&cli.max_memory_mib)?;
+    let defaults = DecodeLimits::default();
+    let limits = DecodeLimits {
+        capture_buffer_bytes: defaults.capture_buffer_bytes.min(max_memory_bytes),
+        max_stream_bytes: defaults.max_stream_bytes.min(max_memory_bytes),
+        max_connection_bytes: defaults.max_connection_bytes.min(max_memory_bytes),
+        max_total_buffered_bytes: max_memory_bytes,
+        max_frame_bytes: defaults.max_frame_bytes.min(max_memory_bytes),
+        max_header_section_bytes: defaults.max_header_section_bytes.min(max_memory_bytes),
+        max_body_bytes: defaults.max_body_bytes.min(max_memory_bytes),
+        max_qpack_table_bytes: defaults.max_qpack_table_bytes.min(max_memory_bytes),
+        ..defaults
+    };
+    let options = ConversionOptions {
+        keylog: cli.keylog,
+        strict: cli.strict,
+        limits,
+    };
+
+    let report = convert_capture(&cli.input, options)
+        .map_err(|error| format!("conversion failed: {error}"))?;
+    write_har(&report.har, cli.output.as_deref())?;
+    write_report(&report);
+
+    Ok(if cli.strict && report.strict_failure() {
+        2
+    } else {
+        0
+    })
+}
+
+fn parse_memory_bytes(value: &str) -> Result<usize, String> {
+    const BYTES_PER_MIB: u128 = 1024 * 1024;
+    let mib = value
+        .parse::<u128>()
+        .map_err(|_| "invalid --max-memory-mib: expected a positive integer".to_string())?;
+    if mib == 0 {
+        return Err("invalid --max-memory-mib: value must be greater than zero".to_string());
+    }
+    mib.checked_mul(BYTES_PER_MIB)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| "invalid --max-memory-mib: value is too large".to_string())
+}
+
+fn write_har(har: &Har, output: Option<&Path>) -> Result<(), String> {
+    match output {
         Some(path) => {
-            File::create(path)
-                .and_then(|mut file| file.write_all(json.as_bytes()))
-                .map_err(|e| e.to_string())
+            let mut file =
+                File::create(path).map_err(|_| "unable to create output file".to_string())?;
+            serde_json::to_writer_pretty(&mut file, har)
+                .map_err(|_| "unable to serialize HAR".to_string())?;
+            file.write_all(b"\n")
+                .map_err(|_| "unable to write output file".to_string())
         }
-        None => io::stdout()
-            .write_all(json.as_bytes())
-            .map_err(|e| e.to_string()),
-    };
+        None => {
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            serde_json::to_writer_pretty(&mut handle, har)
+                .map_err(|_| "unable to serialize HAR".to_string())?;
+            handle
+                .write_all(b"\n")
+                .map_err(|_| "unable to write HAR to stdout".to_string())
+        }
+    }
+}
 
-    if let Err(e) = result {
-        eprintln!("Error writing output: {}", e);
-        process::exit(1);
+fn write_report(report: &ConversionReport) {
+    for diagnostic in &report.diagnostics {
+        eprintln!(
+            "diagnostic severity={} code={} scope={} message={}",
+            severity_name(diagnostic.severity),
+            diagnostic_code_name(diagnostic.code),
+            diagnostic_scope_name(&diagnostic.scope),
+            diagnostic.message
+        );
+    }
+    eprintln!(
+        "stats datagrams={} tcp={} udp={} connections={} exchanges={} dropped={}",
+        report.stats.datagrams_seen,
+        report.stats.tcp_packets_seen,
+        report.stats.udp_packets_seen,
+        report.stats.connections_seen,
+        report.stats.exchanges_emitted,
+        report.stats.packets_dropped
+    );
+}
+
+fn severity_name(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Info => "info",
+        Severity::Warning => "warning",
+        Severity::Error => "error",
+    }
+}
+
+fn diagnostic_code_name(code: DiagnosticCode) -> &'static str {
+    match code {
+        DiagnosticCode::UnsupportedLinkType => "unsupported_link_type",
+        DiagnosticCode::MalformedDatagram => "malformed_datagram",
+        DiagnosticCode::MissingSecret => "missing_secret",
+        DiagnosticCode::AuthenticationFailed => "authentication_failed",
+        DiagnosticCode::ResourceLimit => "resource_limit",
+        DiagnosticCode::IncompleteStream => "incomplete_stream",
+        DiagnosticCode::UnsupportedProtocol => "unsupported_protocol",
+    }
+}
+
+fn diagnostic_scope_name(scope: &DiagnosticScope) -> String {
+    match scope {
+        DiagnosticScope::Capture => "capture".to_string(),
+        DiagnosticScope::Datagram { index } => format!("datagram:{index}"),
+        DiagnosticScope::Connection { connection } => format!("connection:{connection}"),
+        DiagnosticScope::Packet { connection, packet } => {
+            format!("connection:{connection}/packet:{packet}")
+        }
+        DiagnosticScope::Stream { connection, stream } => {
+            format!("connection:{connection}/stream:{stream}")
+        }
     }
 }

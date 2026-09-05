@@ -302,10 +302,7 @@ mod tests {
 
         let request = &parsed["log"]["entries"][0]["request"];
         assert_eq!(request["method"], "GET");
-        assert_eq!(
-            request["url"],
-            "http://localhost:3000/test.html?q=3&v=4"
-        );
+        assert_eq!(request["url"], "http://localhost:3000/test.html?q=3&v=4");
         assert_eq!(request["httpVersion"], "HTTP/1.1");
 
         let headers = request["headers"].as_array().unwrap();

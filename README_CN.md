@@ -6,19 +6,22 @@
 
 ## 项目概述
 
-该工具将网络数据包捕获文件 (PCAP) 转换为 HAR (HTTP Archive) JSON 格式，使分析 HTTP/HTTPS 流量变得更加容易。它支持多种协议，包括 HTTP/1.x、HTTP/2、HTTPS（支持 TLS 解密）和 FastCGI，特别适用于 Web 开发、API 调试和网络流量分析。
+该工具将 PCAP/PCAPNG 转换为 HAR JSON，支持 HTTP/1.x、HTTP/2、HTTP/3 over QUIC、TLS 解密和 FastCGI。运行时不会调用外部协议解析工具。
 
 ## 功能特性
 
 - **多协议支持**
   - HTTP/1.0 和 HTTP/1.1
   - HTTP/2（支持 HPACK 头部解压缩）
+  - HTTP/3（支持静态和动态 QPACK）
+  - QUIC v1/v2（支持 AES-GCM 和 ChaCha20-Poly1305）
   - 支持 TLS 1.2 和 TLS 1.3 解密的 HTTPS
   - FastCGI 协议解析
 
 - **高级功能**
   - TCP 流重组，精确跟踪会话
-  - 使用 keylog 文件解密 TLS 流量
+  - 有界 QUIC CRYPTO/STREAM 重组、CID 迁移、Retry 和密钥更新
+  - 使用 NSS keylog sidecar 或 pcapng DSB 解密 TLS/QUIC
   - 自动配对请求和响应
   - 处理多个并发请求
   - Gzip/deflate 内容解压缩
@@ -33,8 +36,9 @@
 
 ### 前置要求
 
-- Rust 1.70 或更高版本
-- libpcap (Linux/macOS) 或 WinPcap/Npcap (Windows)
+- Rust 1.88 或更高版本
+
+转换器使用纯 Rust 流式读取抓包文件，不依赖 libpcap、tshark 或其他运行时协议解析器。
 
 ### 从源码编译
 
@@ -104,6 +108,9 @@ eCapture 可以捕获 HTTPS 流量并自动解密 TLS 通信，将解密后的�
 # 捕获 HTTPS 流量并保存为包含解密内容的 pcapng 文件
 sudo ecapture tls -m pcapng -i eth0 --pcapfile=capture.pcapng "tcp port 443"
 
+# 捕获 QUIC 时需要包含 UDP
+sudo ecapture tls -m pcapng -i eth0 --pcapfile=quic.pcapng "udp port 443"
+
 # 捕获所有网络接口的流量
 sudo ecapture tls -m pcapng -i any --pcapfile=capture.pcapng
 
@@ -113,10 +120,13 @@ sudo ecapture tls -m pcapng -i any --pcapfile=capture.pcapng "tcp port 80"
 
 #### 步骤 2：转换为 HAR
 
-由于 eCapture 直接在 PCAP 文件中输出解密的明文，你可以立即转换它，无需任何额外配置：
+对于 QUIC，需要捕获 UDP 数据报，并将 NSS secrets 写入 pcapng DSB，或单独提供 NSS keylog。QUIC/HTTP3 解析由本工具原生完成：
 
 ```bash
 pcap2har capture.pcapng -o output.har
+
+# 使用 sidecar keylog
+pcap2har capture.pcapng --keylog sslkeys.log -o output.har
 ```
 
 ## 查看 HAR 文件
@@ -165,6 +175,8 @@ pcap2har capture.pcapng -o output.har
 - `tcp.rs`：TCP 流重组和数据包排序
 - `http.rs`：HTTP/1.x 协议解析
 - `http2.rs`：HTTP/2 帧解析和 HPACK 解压缩
+- `quic/`：QUIC v1/v2 被动解密和流重组
+- `http3/`：HTTP/3 路由、QPACK 和消息组装
 - `tls.rs`：TLS 记录解析和解密
 - `fcgi.rs`：FastCGI 协议解析
 - `har.rs`：HAR 格式数据结构
@@ -193,6 +205,12 @@ pcap2har capture.pcapng -o output.har
 - Keylog 文件支持
 - 多种密码套件
 
+### QUIC/HTTP/3
+- QUIC v1/v2 Initial、Handshake、0-RTT 和 1-RTT
+- AES-128-GCM、AES-256-GCM 和 ChaCha20-Poly1305
+- Retry 完整性、CID、迁移、包号空间和密钥更新
+- HTTP/3 请求/响应正文以及静态/动态 QPACK 头部
+
 ### FastCGI
 - 请求解析
 - 响应解析
@@ -202,19 +220,21 @@ pcap2har capture.pcapng -o output.har
 
 - **TLS 解密**：需要 keylog 文件；没有 keylog 无法解密完全前向保密 (PFS) 连接
 - **WebSocket**：尚未实现 WebSocket 帧解析
-- **QUIC/HTTP3**：目前不支持
 - **分片数据包**：TCP 重组中的某些边缘情况可能无法完美处理
-- **内存使用**：大型 PCAP 文件会加载到内存中；超大文件（>1GB）可能需要大量 RAM
+- **IP 分片**：IPv4/IPv6 分片数据报会被拒绝并输出诊断
+- **解密密钥**：加密 TLS/QUIC 应用数据需要匹配的 NSS secrets
 
 ## 依赖项
 
 该项目使用以下主要 crate：
 
-- [pcap](https://crates.io/crates/pcap) - PCAP 文件解析
+- [pcap-parser](https://crates.io/crates/pcap-parser) - 流式 PCAP/PCAPNG 解析
 - [etherparse](https://crates.io/crates/etherparse) - 网络协议解析
 - [httparse](https://crates.io/crates/httparse) - HTTP 头部解析
 - [serde_json](https://crates.io/crates/serde_json) - JSON 序列化
 - [rustls](https://crates.io/crates/rustls) - TLS 协议支持
+- [RustCrypto](https://github.com/RustCrypto) - 原生 QUIC 数据包保护
+- [compcol](https://crates.io/crates/compcol) - QPACK 解码
 - [clap](https://crates.io/crates/clap) - 命令行参数解析
 
 ## 贡献
@@ -250,4 +270,3 @@ pcap2har capture.pcapng -o output.har
 - [eCapture](https://github.com/gojue/ecapture)：使用 eBPF 捕获 SSL/TLS 流量
 - [mitmproxy](https://mitmproxy.org/)：交互式 HTTPS 代理
 - [Reqable](https://reqable.com/)：API 调试和 HTTP 流量分析工具
-

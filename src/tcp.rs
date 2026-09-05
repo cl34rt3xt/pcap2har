@@ -1,23 +1,20 @@
-use crate::tls::TlsSecrets;
+use crate::{DecodeLimits, NormalizedTcpPacket};
 use chrono::{DateTime, Utc};
-use etherparse::{IpNumber, SlicedPacket};
-use pcap::Capture;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
-use std::net::IpAddr;
-use std::path::Path;
+use std::net::{IpAddr, SocketAddr};
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum TcpError {
-    #[error("PCAP error: {0}")]
-    Pcap(#[from] pcap::Error),
     #[error("Parse error: {0}")]
     Parse(String),
+    #[error("packet timestamp is outside the supported range")]
+    TimestampOutOfRange,
+    #[error("TCP reassembly exceeds configured limits")]
+    ResourceLimit,
 }
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct StreamKey {
     pub src_ip: IpAddr,
     pub dst_ip: IpAddr,
@@ -88,11 +85,7 @@ impl TcpStream {
                     next_seq = Some(seg_end);
                 }
                 Some(expected) => {
-                    if segment.seq == expected {
-                        data.extend_from_slice(&segment.data);
-                        timestamps.push(segment.timestamp);
-                        next_seq = Some(seg_end);
-                    } else if segment.seq > expected {
+                    if segment.seq >= expected {
                         data.extend_from_slice(&segment.data);
                         timestamps.push(segment.timestamp);
                         next_seq = Some(seg_end);
@@ -123,125 +116,118 @@ impl TcpStream {
 
 pub struct TcpReassembler {
     streams: HashMap<StreamKey, TcpStream>,
-    pub tls_secrets: TlsSecrets,
+    stream_usage: HashMap<StreamKey, StreamUsage>,
+    connections: HashMap<ConnectionKey, usize>,
+    total_buffered_bytes: usize,
+    limits: DecodeLimits,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StreamUsage {
+    bytes: usize,
+    segments: usize,
+}
+
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+struct ConnectionKey {
+    first: SocketAddr,
+    second: SocketAddr,
+}
+
+impl ConnectionKey {
+    fn new(src: SocketAddr, dst: SocketAddr) -> Self {
+        if src <= dst {
+            Self {
+                first: src,
+                second: dst,
+            }
+        } else {
+            Self {
+                first: dst,
+                second: src,
+            }
+        }
+    }
 }
 
 impl TcpReassembler {
     pub fn new() -> Self {
-        TcpReassembler {
+        Self::with_limits(DecodeLimits::default())
+    }
+
+    pub(crate) fn with_limits(limits: DecodeLimits) -> Self {
+        Self {
             streams: HashMap::new(),
-            tls_secrets: TlsSecrets::new(),
+            stream_usage: HashMap::new(),
+            connections: HashMap::new(),
+            total_buffered_bytes: 0,
+            limits,
         }
     }
 
-    pub fn process_pcap<P: AsRef<Path>>(&mut self, path: P) -> Result<(), TcpError> {
-        self.extract_dsb_secrets(path.as_ref())?;
-
-        let mut cap = Capture::from_file(path)?;
-
-        while let Ok(packet) = cap.next_packet() {
-            let timestamp = {
-                let ts = packet.header.ts;
-                DateTime::from_timestamp(ts.tv_sec as i64, (ts.tv_usec * 1000) as u32)
-                    .unwrap_or_else(Utc::now)
-            };
-
-            if let Ok(sliced) = SlicedPacket::from_ethernet(packet.data) {
-                self.process_packet(&sliced, timestamp);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn extract_dsb_secrets(&mut self, path: &Path) -> Result<(), TcpError> {
-        let mut file = File::open(path).map_err(|e| TcpError::Parse(e.to_string()))?;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data).map_err(|e| TcpError::Parse(e.to_string()))?;
-
-        if data.len() < 12 {
-            return Ok(());
-        }
-
-        if data[0..4] != [0x0A, 0x0D, 0x0D, 0x0A] {
-            return Ok(());
-        }
-
-        let mut pos = 0;
-        while pos + 8 <= data.len() {
-            let block_type = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-            let block_len = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]) as usize;
-
-            if block_len < 12 || pos + block_len > data.len() {
-                break;
-            }
-
-            if block_type == 0x0000000A {
-                if block_len >= 16 {
-                    let secrets_type = u32::from_le_bytes([data[pos + 8], data[pos + 9], data[pos + 10], data[pos + 11]]);
-                    let secrets_len = u32::from_le_bytes([data[pos + 12], data[pos + 13], data[pos + 14], data[pos + 15]]) as usize;
-
-                    if (secrets_type == 0x544c534b || secrets_type == 0x4b534c54)
-                        && pos + 16 + secrets_len <= data.len()
-                    {
-                        let secrets_data = &data[pos + 16..pos + 16 + secrets_len];
-                        self.tls_secrets.parse_keylog(secrets_data);
-                    }
-                }
-            }
-
-            pos += block_len;
-        }
-
-        Ok(())
-    }
-
-    fn process_packet(&mut self, packet: &SlicedPacket, timestamp: DateTime<Utc>) {
-        let (src_ip, dst_ip) = match &packet.net {
-            Some(etherparse::NetSlice::Ipv4(ipv4)) => {
-                let header = ipv4.header();
-                if header.protocol() != IpNumber::TCP {
-                    return;
-                }
-                (
-                    IpAddr::V4(header.source_addr()),
-                    IpAddr::V4(header.destination_addr()),
-                )
-            }
-            Some(etherparse::NetSlice::Ipv6(ipv6)) => {
-                let header = ipv6.header();
-                if header.next_header() != IpNumber::TCP {
-                    return;
-                }
-                (
-                    IpAddr::V6(header.source_addr()),
-                    IpAddr::V6(header.destination_addr()),
-                )
-            }
-            _ => return,
-        };
-
-        let tcp = match &packet.transport {
-            Some(etherparse::TransportSlice::Tcp(tcp)) => tcp,
-            _ => return,
-        };
-
+    pub fn ingest(&mut self, packet: NormalizedTcpPacket) -> Result<bool, TcpError> {
+        let timestamp_ns =
+            i64::try_from(packet.timestamp_ns).map_err(|_| TcpError::TimestampOutOfRange)?;
+        let timestamp = DateTime::<Utc>::from_timestamp_nanos(timestamp_ns);
         let key = StreamKey {
-            src_ip,
-            dst_ip,
-            src_port: tcp.source_port(),
-            dst_port: tcp.destination_port(),
+            src_ip: packet.src.ip(),
+            dst_ip: packet.dst.ip(),
+            src_port: packet.src.port(),
+            dst_port: packet.dst.port(),
         };
+        let connection_key = ConnectionKey::new(packet.src, packet.dst);
+        let new_connection = !self.connections.contains_key(&connection_key);
+        if new_connection && self.connections.len() >= self.limits.max_connections {
+            return Err(TcpError::ResourceLimit);
+        }
+
+        let payload_len = packet.payload.len();
+        let usage = self.stream_usage.get(&key).copied().unwrap_or_default();
+        let stream_bytes = usage
+            .bytes
+            .checked_add(payload_len)
+            .filter(|bytes| *bytes <= self.limits.max_stream_bytes)
+            .ok_or(TcpError::ResourceLimit)?;
+        let stream_segments = usage
+            .segments
+            .checked_add(1)
+            .filter(|segments| *segments <= self.limits.max_ranges_per_stream)
+            .ok_or(TcpError::ResourceLimit)?;
+        let connection_bytes = self
+            .connections
+            .get(&connection_key)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(payload_len)
+            .filter(|bytes| *bytes <= self.limits.max_connection_bytes)
+            .ok_or(TcpError::ResourceLimit)?;
+        let total_buffered_bytes = self
+            .total_buffered_bytes
+            .checked_add(payload_len)
+            .filter(|bytes| *bytes <= self.limits.max_total_buffered_bytes)
+            .ok_or(TcpError::ResourceLimit)?;
 
         let segment = TcpSegment {
-            seq: tcp.sequence_number(),
-            data: tcp.payload().to_vec(),
+            seq: packet.sequence,
+            data: packet.payload,
             timestamp,
-            fin: tcp.fin(),
+            fin: packet.fin,
         };
-
-        let stream = self.streams.entry(key.clone()).or_insert_with(|| TcpStream::new(key));
+        self.stream_usage.insert(
+            key.clone(),
+            StreamUsage {
+                bytes: stream_bytes,
+                segments: stream_segments,
+            },
+        );
+        self.connections.insert(connection_key, connection_bytes);
+        self.total_buffered_bytes = total_buffered_bytes;
+        let stream = self
+            .streams
+            .entry(key.clone())
+            .or_insert_with(|| TcpStream::new(key));
         stream.add_segment(segment);
+        Ok(new_connection)
     }
 
     pub fn get_streams(self) -> HashMap<StreamKey, TcpStream> {
@@ -503,7 +489,7 @@ mod tests {
         };
 
         let mut stream = TcpStream::new(key);
-        
+
         use chrono::Duration;
         let now = Utc::now();
         let later = now + Duration::seconds(1);
@@ -536,7 +522,7 @@ mod tests {
         };
 
         let mut stream = TcpStream::new(key);
-        
+
         use chrono::Duration;
         let now = Utc::now();
         let later = now + Duration::seconds(1);
@@ -563,7 +549,7 @@ mod tests {
     fn test_tcp_reassembler_new() {
         let reassembler = TcpReassembler::new();
         let streams = reassembler.get_streams();
-        
+
         assert!(streams.is_empty());
     }
 
@@ -571,7 +557,7 @@ mod tests {
     fn test_tcp_reassembler_default() {
         let reassembler = TcpReassembler::default();
         let streams = reassembler.get_streams();
-        
+
         assert!(streams.is_empty());
     }
 
