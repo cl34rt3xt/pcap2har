@@ -1,44 +1,50 @@
 name: Build Release Binaries
+permissions:
+  contents: read
 
 on:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
   pull_request:
-    branches: [ main, master ]
-  release:
-    types: [ created ]
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build ${{ matrix.platform.target }}
-    runs-on: ${{ matrix.platform.os }}
-    
+    name: Build ${{ matrix.platform.target }} (ubuntu ${{ matrix.platform.ubuntu-version }})
+    runs-on: ubuntu-latest
+    container: ubuntu:${{ matrix.platform.ubuntu-version }}
+
     strategy:
       fail-fast: false
       matrix:
         platform:
-          # Linux
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            name: linux-x86_64
-            
-          # macOS Intel
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            name: macos-x86_64
-            
-          # macOS Apple Silicon (M-series chips)
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            name: macos-aarch64
-            
-          # Windows
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            name: windows-x86_64
+          # Linux - built separately per Ubuntu version so the resulting
+          # binary links against that version's glibc instead of requiring
+          # a newer one than the target system has.
+          - target: x86_64-unknown-linux-gnu
+            ubuntu-version: "20.04"
+            name: linux-x86_64-ubuntu20.04
+          - target: x86_64-unknown-linux-gnu
+            ubuntu-version: "22.04"
+            name: linux-x86_64-ubuntu22.04
+          - target: x86_64-unknown-linux-gnu
+            ubuntu-version: "24.04"
+            name: linux-x86_64-ubuntu24.04
+          - target: x86_64-unknown-linux-gnu
+            ubuntu-version: "26.04"
+            name: linux-x86_64-ubuntu26.04
 
     steps:
+      - name: Install Linux dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y curl build-essential pkg-config libpcap-dev ca-certificates
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -47,70 +53,14 @@ jobs:
         with:
           targets: ${{ matrix.platform.target }}
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-git-
-
-      - name: Cache target directory
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-target-${{ matrix.platform.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-target-${{ matrix.platform.target }}-
-
-      # Install Linux-specific dependencies
-      - name: Install Linux dependencies
-        if: matrix.platform.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libpcap-dev
-
-      # Install macOS-specific dependencies
-      - name: Install macOS dependencies
-        if: matrix.platform.os == 'macos-latest'
-        run: |
-          brew install libpcap
-
-      # Install Windows-specific dependencies (Npcap SDK only, runtime not needed for compilation)
-      - name: Download and setup Npcap SDK
-        if: matrix.platform.os == 'windows-latest'
-        run: |
-          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.15.zip" -OutFile "npcap-sdk.zip"
-          Expand-Archive -Path "npcap-sdk.zip" -DestinationPath "C:\npcap-sdk"
-          $lib_path = "C:\npcap-sdk\Lib\x64"
-          $include_path = "C:\npcap-sdk\Include"
-          echo "LIB=$lib_path;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "INCLUDE=$include_path;$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        shell: powershell
-
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.platform.target }}
 
-      - name: Prepare artifacts (Unix)
-        if: matrix.platform.os != 'windows-latest'
+      - name: Prepare artifacts
         run: |
           mkdir -p artifacts
           cp target/${{ matrix.platform.target }}/release/pcap2har artifacts/pcap2har-${{ matrix.platform.name }}
           chmod +x artifacts/pcap2har-${{ matrix.platform.name }}
-
-      - name: Prepare artifacts (Windows)
-        if: matrix.platform.os == 'windows-latest'
-        run: |
-          mkdir artifacts
-          copy target\${{ matrix.platform.target }}\release\pcap2har.exe artifacts\pcap2har-${{ matrix.platform.name }}.exe
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -119,7 +69,6 @@ jobs:
           path: artifacts/*
           if-no-files-found: error
 
-  # Optional: Create a merged artifact containing all platform binaries
   merge-artifacts:
     name: Merge all artifacts
     needs: build
@@ -142,25 +91,3 @@ jobs:
           name: pcap2har-all-platforms
           path: merged-artifacts/*
           if-no-files-found: error
-
-  # Optional: Automatically upload to GitHub Release when a release tag is created
-  release:
-    name: Upload to Release
-    needs: build
-    if: github.event_name == 'release'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v1
-        with:
-          files: artifacts/**/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
