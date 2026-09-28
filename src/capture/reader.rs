@@ -206,6 +206,8 @@ impl CaptureReader {
             }
             PcapBlockOwned::NG(_) => Ok(()),
         })
+        // build_index already reported a truncated final block as a diagnostic
+        .map(|_| ())
     }
 }
 
@@ -248,7 +250,7 @@ fn build_index(
     let mut index = CaptureIndex::default();
     let mut state = IndexPassState::default();
     let mut resource_budget = CaptureResourceBudget::new(limits.max_total_buffered_bytes);
-    stream_capture(path, limits, |block| match block {
+    let end = stream_capture(path, limits, |block| match block {
         PcapBlockOwned::LegacyHeader(header) => {
             if state.legacy_header_seen {
                 return Err(CaptureError::Malformed);
@@ -316,6 +318,19 @@ fn build_index(
         }
         PcapBlockOwned::NG(_) => Ok(()),
     })?;
+    if let StreamEnd::TruncatedBlock { offset } = end {
+        push_diagnostic(
+            &mut index,
+            &mut resource_budget,
+            Diagnostic::warning(
+                DiagnosticCode::TruncatedCapture,
+                DiagnosticScope::Capture,
+                format!(
+                    "capture ends partway through a block at byte {offset}; the incomplete block was ignored"
+                ),
+            ),
+        )?;
+    }
     Ok((index, resource_budget))
 }
 
@@ -544,7 +559,22 @@ fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, CaptureError> 
     Ok(data)
 }
 
-fn stream_capture<F>(path: &Path, limits: &DecodeLimits, mut handle: F) -> Result<(), CaptureError>
+/// How a capture stream ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEnd {
+    Complete,
+    /// The file ended partway through a block, e.g. because the capture was cut off
+    /// mid-write. Every block before `offset` was delivered; the partial one was not.
+    TruncatedBlock {
+        offset: usize,
+    },
+}
+
+fn stream_capture<F>(
+    path: &Path,
+    limits: &DecodeLimits,
+    mut handle: F,
+) -> Result<StreamEnd, CaptureError>
 where
     F: for<'a> FnMut(PcapBlockOwned<'a>) -> Result<(), CaptureError>,
 {
@@ -555,7 +585,14 @@ where
                 handle(block)?;
                 reader.consume(offset);
             }
-            Err(PcapError::Eof) => return Ok(()),
+            Err(PcapError::Eof) => return Ok(StreamEnd::Complete),
+            // The parser only reports this once the file is exhausted, so it is a cut-off
+            // final block rather than corruption (which surfaces as a nom error).
+            Err(PcapError::UnexpectedEof) => {
+                return Ok(StreamEnd::TruncatedBlock {
+                    offset: reader.consumed(),
+                })
+            }
             Err(PcapError::Incomplete(_)) => reader.refill().map_err(map_parser_error)?,
             Err(PcapError::BufferTooSmall) => {
                 grow_reader(

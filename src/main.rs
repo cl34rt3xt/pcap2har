@@ -184,6 +184,7 @@ fn diagnostic_code_name(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::ResourceLimit => "resource_limit",
         DiagnosticCode::IncompleteStream => "incomplete_stream",
         DiagnosticCode::UnsupportedProtocol => "unsupported_protocol",
+        DiagnosticCode::TruncatedCapture => "truncated_capture",
     }
 }
 

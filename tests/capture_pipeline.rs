@@ -9,7 +9,7 @@ use hpack::Encoder;
 use pcap2har::{
     convert_capture, CaptureError, CaptureReader, CapturedPacket, ConversionError,
     ConversionOptions, DecodeLimits, DiagnosticCode, DiagnosticScope, LinkDecoder, LinkError,
-    LinkType, TransportPacket,
+    LinkType, Severity, TransportPacket,
 };
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -527,15 +527,47 @@ fn capture_index_diagnostics_are_copied_to_report() {
 }
 
 #[test]
-fn malformed_capture_remains_a_conversion_error() {
-    let mut bytes = big_endian_pcapng(&[9, 10]);
-    bytes.truncate(bytes.len() - 3);
+fn truncated_header_remains_a_conversion_error() {
+    let mut bytes = legacy_pcap_packets(&http_exchange_frames(50_000));
+    bytes.truncate(10);
     let file = TempCapture::new(bytes);
 
     assert!(matches!(
         convert_capture(file.path(), ConversionOptions::default()),
         Err(ConversionError::Capture(CaptureError::Truncated))
     ));
+}
+
+#[test]
+fn truncated_final_block_keeps_earlier_exchanges() {
+    let mut frames = http_exchange_frames(50_000);
+    frames.push(http_exchange_frames(50_001).remove(0));
+    let mut bytes = legacy_pcap_packets(&frames);
+    // 16-byte legacy record header precedes each packet
+    let complete_len = bytes.len() - 16 - frames[2].len();
+    bytes.truncate(bytes.len() - 3);
+    let file = TempCapture::new(bytes);
+
+    let report = convert_capture(file.path(), ConversionOptions::default()).unwrap();
+
+    assert_eq!(report.har.log.entries.len(), 1);
+    assert_eq!(
+        report.har.log.entries[0].request.url,
+        "http://example.test/health"
+    );
+    assert_eq!(report.har.log.entries[0].response.status, 200);
+    assert_eq!(report.stats.datagrams_seen, 2);
+    let truncations: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == DiagnosticCode::TruncatedCapture)
+        .collect();
+    assert_eq!(truncations.len(), 1);
+    assert_eq!(truncations[0].severity, Severity::Warning);
+    assert_eq!(truncations[0].scope, DiagnosticScope::Capture);
+    assert!(truncations[0]
+        .message
+        .contains(&format!("at byte {complete_len};")));
 }
 
 #[test]
@@ -849,15 +881,47 @@ fn flattens_interface_ids_across_pcapng_sections() {
 }
 
 #[test]
-fn rejects_truncated_capture_blocks() {
+fn tolerates_truncated_final_capture_block() {
+    let mut data = pcapng_with_packets(&[1], false, &[(0, 1, vec![9, 10]), (0, 2, vec![11, 12])]);
+    data.truncate(data.len() - 3);
+    let file = TempCapture::new(data);
+
+    let reader = CaptureReader::open(file.path(), DecodeLimits::default()).unwrap();
+    let mut packets = Vec::new();
+    reader
+        .for_each_packet(&mut |packet| {
+            packets.push(packet.data);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(reader.index().packet_count, 1);
+    assert_eq!(packets, vec![vec![9, 10]]);
+    assert_eq!(
+        reader
+            .index()
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::TruncatedCapture)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn big_endian_pcapng_truncated_inside_only_block_is_empty_not_fatal() {
     let mut data = big_endian_pcapng(&[9, 10]);
     data.truncate(data.len() - 3);
     let file = TempCapture::new(data);
 
-    assert!(matches!(
-        CaptureReader::open(file.path(), DecodeLimits::default()),
-        Err(CaptureError::Truncated)
-    ));
+    let reader = CaptureReader::open(file.path(), DecodeLimits::default()).unwrap();
+
+    assert_eq!(reader.index().packet_count, 0);
+    assert!(reader
+        .index()
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == DiagnosticCode::TruncatedCapture));
 }
 
 #[test]

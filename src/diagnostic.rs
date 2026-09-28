@@ -23,6 +23,7 @@ pub enum DiagnosticCode {
     ResourceLimit,
     IncompleteStream,
     UnsupportedProtocol,
+    TruncatedCapture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

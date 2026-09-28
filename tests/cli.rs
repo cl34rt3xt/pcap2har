@@ -322,6 +322,50 @@ fn bodies_above_default_limit_are_complete_with_larger_max_body_mib() {
 }
 
 #[test]
+fn truncated_final_packet_converts_earlier_exchanges_with_warning() {
+    let mut bytes = legacy_pcap_packets(&[
+        tcp_frame(
+            50_040,
+            8080,
+            b"GET /health HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        ),
+        support::capture::ethernet(
+            0x0800,
+            &support::capture::ipv4_tcp(
+                [192, 0, 2, 20],
+                [192, 0, 2, 10],
+                8080,
+                50_040,
+                1,
+                false,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK",
+            ),
+        ),
+        tcp_frame(50_041, 8080, b"GET /cut HTTP/1.1\r\n"),
+    ]);
+    bytes.truncate(bytes.len() - 10);
+    let capture = TempCapture::new(bytes);
+    let path = capture.path().to_str().unwrap();
+
+    let output = run(&[path]);
+    let har: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(har["log"]["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        har["log"]["entries"][0]["request"]["url"],
+        "http://example.test/health"
+    );
+    assert!(stderr.contains("diagnostic severity=warning code=truncated_capture scope=capture"));
+    assert!(stderr.ends_with("stats datagrams=2 tcp=2 udp=0 connections=1 exchanges=1 dropped=0\n"));
+
+    let strict = run(&["--strict", path]);
+    assert_eq!(strict.status.code(), Some(2));
+    assert_eq!(strict.stdout, output.stdout);
+}
+
+#[test]
 fn fatal_capture_error_is_exit_one_without_packet_content() {
     let marker = "secret-packet-marker";
     let output = run(&[marker]);
