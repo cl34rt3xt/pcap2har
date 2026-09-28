@@ -49,6 +49,10 @@ pub struct Entry {
     pub timings: Timings,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_ip_address: Option<String>,
+    /// HAR `connection`: the TCP/UDP endpoints of the exchange, as `client->server`
+    /// (e.g. `192.0.2.10:50000->192.0.2.20:80`, IPv6 addresses in brackets).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
 }
 
 fn serialize_time_ms<S>(time_ns: &i64, serializer: S) -> Result<S::Ok, S::Error>
@@ -298,6 +302,7 @@ mod tests {
             cache: Cache {},
             timings: Timings::default(),
             server_ip_address: Some("127.0.0.1".to_string()),
+            connection: None,
         };
 
         har.add_entry(entry);
@@ -407,6 +412,7 @@ mod tests {
                 ssl: -1,
             },
             server_ip_address: Some("127.0.0.1".to_string()),
+            connection: None,
         };
 
         har.add_entry(entry);
@@ -487,6 +493,7 @@ mod tests {
                 cache: Cache {},
                 timings: Timings::default(),
                 server_ip_address: None,
+                connection: None,
             };
             har.add_entry(entry);
         }
@@ -552,6 +559,7 @@ mod tests {
             cache: Cache {},
             timings: Timings::default(),
             server_ip_address: None,
+            connection: None,
         };
 
         har.add_entry(entry);

@@ -67,7 +67,12 @@ pub fn parse_request_bounded(
                 })
                 .collect();
 
-            let extracted = extract_body_bounded(&data[header_len..], &headers, max_body_bytes);
+            let extracted = extract_body_bounded(
+                &data[header_len..],
+                &headers,
+                max_body_bytes,
+                MessageKind::Request,
+            );
 
             Ok((
                 Some(ParsedRequest {
@@ -129,6 +134,7 @@ pub fn parse_all_requests_bounded(
                     &remaining[header_len..],
                     &headers,
                     max_body_bytes.min(remaining_body_bytes),
+                    MessageKind::Request,
                 );
                 remaining_body_bytes = remaining_body_bytes.saturating_sub(extracted.body.len());
                 body_limit_exceeded |= extracted.limit_exceeded;
@@ -180,7 +186,12 @@ pub fn parse_response_bounded(
                 })
                 .collect();
 
-            let extracted = extract_body_bounded(&data[header_len..], &headers, max_body_bytes);
+            let extracted = extract_body_bounded(
+                &data[header_len..],
+                &headers,
+                max_body_bytes,
+                MessageKind::Response,
+            );
 
             Ok((
                 Some(ParsedResponse {
@@ -244,6 +255,7 @@ pub fn parse_all_responses_bounded(
                     &remaining[header_len..],
                     &headers,
                     max_body_bytes.min(remaining_body_bytes),
+                    MessageKind::Response,
                 );
                 remaining_body_bytes = remaining_body_bytes.saturating_sub(extracted.body.len());
                 body_limit_exceeded |= extracted.limit_exceeded;
@@ -270,7 +282,7 @@ pub fn parse_all_responses_bounded(
 
 #[cfg(test)]
 fn extract_body_with_length(data: &[u8], headers: &[(String, String)]) -> (Vec<u8>, usize) {
-    let extracted = extract_body_bounded(data, headers, usize::MAX);
+    let extracted = extract_body_bounded(data, headers, usize::MAX, MessageKind::Response);
     (extracted.body, extracted.consumed)
 }
 
@@ -292,10 +304,17 @@ impl ExtractedBody {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MessageKind {
+    Request,
+    Response,
+}
+
 fn extract_body_bounded(
     data: &[u8],
     headers: &[(String, String)],
     max_body_bytes: usize,
+    kind: MessageKind,
 ) -> ExtractedBody {
     let content_length = headers
         .iter()
@@ -317,8 +336,12 @@ fn extract_body_bounded(
             actual_len,
             actual_len < len,
         )
+    } else if kind == MessageKind::Request {
+        // a request without Content-Length or chunked framing has no body (RFC 9112 6.3), so
+        // anything after it is the next keep-alive request rather than this one's body
+        (Cow::Borrowed(&data[..0]), 0, false)
     } else {
-        // delimited by connection close, so whatever was captured is the whole body
+        // a response is delimited by connection close, so whatever was captured is the whole body
         (Cow::Borrowed(data), data.len(), false)
     };
 
@@ -823,6 +846,20 @@ mod tests {
         assert_eq!(capped.body.len(), 100);
         assert_eq!(capped.encoded_body_size, compressed.len());
         assert!(capped.body_truncated);
+    }
+
+    #[test]
+    fn keep_alive_requests_without_body_framing_are_separate() {
+        let data = b"GET /a HTTP/1.1\r\nHost: example.test\r\n\r\n\
+                     GET /b HTTP/1.1\r\nHost: example.test\r\n\r\n";
+
+        let requests = parse_all_requests(data);
+
+        assert_eq!(
+            requests.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            ["/a", "/b"]
+        );
+        assert!(requests.iter().all(|r| r.body.is_empty()));
     }
 
     #[test]

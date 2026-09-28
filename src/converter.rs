@@ -505,6 +505,7 @@ impl Converter {
             cache: Cache {},
             timings: Timings::default(),
             server_ip_address: Some(exchange.server.ip().to_string()),
+            connection: Some(format!("{}->{}", exchange.client, exchange.server)),
         }
     }
 
@@ -1358,6 +1359,18 @@ mod tests {
         assert_eq!(entry.request.method, "GET");
         assert_eq!(entry.response.status, 200);
         assert_eq!(entry.server_ip_address, Some("93.184.216.34".to_string()));
+        assert_eq!(
+            entry.connection.as_deref(),
+            Some("192.168.1.10:54321->93.184.216.34:80")
+        );
+
+        let mut v6 = exchange.clone();
+        v6.client = "[2001:db8::10]:54321".parse().unwrap();
+        v6.server = "[2001:db8::20]:80".parse().unwrap();
+        assert_eq!(
+            converter.exchange_to_entry(&v6).connection.as_deref(),
+            Some("[2001:db8::10]:54321->[2001:db8::20]:80")
+        );
     }
 
     #[test]
