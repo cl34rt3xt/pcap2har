@@ -24,6 +24,10 @@ pub struct NormalizedResponse {
     pub trailers: HeaderFields,
     pub body: Vec<u8>,
     pub header_size: usize,
+    /// Body length as transferred, before any `Content-Encoding` was undone.
+    pub encoded_body_size: usize,
+    /// `body` is not the whole body (decode limit hit, or the capture ends before it does).
+    pub body_truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

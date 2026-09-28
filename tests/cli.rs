@@ -310,15 +310,20 @@ fn bodies_above_default_limit_are_complete_with_larger_max_body_mib() {
         let har: Value = serde_json::from_slice(&output.stdout).unwrap();
         let content = &har["log"]["entries"][0]["response"]["content"];
         assert_eq!(content["encoding"], "base64");
-        STANDARD.decode(content["text"].as_str().unwrap()).unwrap()
+        (
+            STANDARD.decode(content["text"].as_str().unwrap()).unwrap(),
+            content.get("_truncated").cloned(),
+        )
     };
 
-    let default = decoded_body(&run(&[path]));
+    let (default, truncated) = decoded_body(&run(&[path]));
     assert!(default.len() < body.len());
     assert_eq!(default, body[..default.len()]);
+    assert_eq!(truncated, Some(Value::Bool(true)));
 
-    let raised = decoded_body(&run(&["--max-body-mib", "32", path]));
+    let (raised, truncated) = decoded_body(&run(&["--max-body-mib", "32", path]));
     assert_eq!(raised, body);
+    assert_eq!(truncated, None);
 }
 
 #[test]

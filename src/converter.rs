@@ -362,6 +362,8 @@ impl Converter {
                         headers: r.headers.clone(),
                         body,
                         header_size: 0,
+                        encoded_body_size: r.body.len(),
+                        body_truncated: limited,
                     }
                 });
 
@@ -570,7 +572,7 @@ impl Converter {
                     content,
                     redirect_url,
                     headers_size: resp.header_size as i64,
-                    body_size: resp.body.len() as i64,
+                    body_size: resp.encoded_body_size as i64,
                 }
             }
             None => Response {
@@ -585,6 +587,7 @@ impl Converter {
                     mime_type: String::new(),
                     text: None,
                     encoding: None,
+                    truncated: false,
                 },
                 redirect_url: String::new(),
                 headers_size: -1,
@@ -624,6 +627,7 @@ impl Converter {
             mime_type,
             text,
             encoding,
+            truncated: resp.body_truncated,
         }
     }
 
@@ -818,6 +822,8 @@ fn normalize_conversation(
             trailers: Vec::new(),
             body: response.body,
             header_size: response.header_size,
+            encoded_body_size: response.encoded_body_size,
+            body_truncated: response.body_truncated,
         }),
         request_started_ns,
         response_started_ns,
@@ -954,6 +960,8 @@ mod tests {
             trailers: Vec::new(),
             body: response.body,
             header_size: response.header_size,
+            encoded_body_size: response.encoded_body_size,
+            body_truncated: response.body_truncated,
         }
     }
 
@@ -1192,6 +1200,8 @@ mod tests {
             ],
             body: br#"{"ok":true}"#.to_vec(),
             header_size: 0,
+            encoded_body_size: 11,
+            body_truncated: false,
         };
 
         let resp = normalized_response(resp);
@@ -1228,6 +1238,8 @@ mod tests {
             )],
             body: b"<html><body>Hello</body></html>".to_vec(),
             header_size: 0,
+            encoded_body_size: 31,
+            body_truncated: false,
         };
 
         let resp = normalized_response(resp);
@@ -1247,6 +1259,8 @@ mod tests {
             headers: vec![("Content-Type".to_string(), "image/png".to_string())],
             body: vec![0x89, 0x50, 0x4E, 0x47], // PNG header
             header_size: 0,
+            encoded_body_size: 4,
+            body_truncated: false,
         };
 
         let resp = normalized_response(resp);
@@ -1268,6 +1282,8 @@ mod tests {
             headers: vec![("Content-Type".to_string(), "text/html".to_string())],
             body: body.clone(),
             header_size: 0,
+            encoded_body_size: body.len(),
+            body_truncated: false,
         };
 
         let resp = normalized_response(resp);
@@ -1326,6 +1342,8 @@ mod tests {
                 headers: vec![],
                 body: vec![],
                 header_size: 80,
+                encoded_body_size: 0,
+                body_truncated: false,
             }),
             src_ip: "192.168.1.10".to_string(),
             dst_ip: "93.184.216.34".to_string(),
@@ -1376,6 +1394,8 @@ mod tests {
                     headers: vec![],
                     body: vec![],
                     header_size: 0,
+                    encoded_body_size: 0,
+                    body_truncated: false,
                 }),
                 src_ip: "127.0.0.1".to_string(),
                 dst_ip: "127.0.0.1".to_string(),

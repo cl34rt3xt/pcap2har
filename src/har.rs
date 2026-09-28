@@ -148,6 +148,10 @@ pub struct Content {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
+    /// Custom HAR field: `text` holds only part of the body (a decode limit was hit, or
+    /// the capture ends before the body does), so `size` and any hash of it are partial.
+    #[serde(rename = "_truncated", skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -285,6 +289,7 @@ mod tests {
                     mime_type: String::new(),
                     text: None,
                     encoding: None,
+                    truncated: false,
                 },
                 redirect_url: String::new(),
                 headers_size: -1,
@@ -385,6 +390,7 @@ mod tests {
                     mime_type: "application/json".to_string(),
                     text: Some(r#"{"ok":true}"#.to_string()),
                     encoding: None,
+                    truncated: false,
                 },
                 redirect_url: String::new(),
                 headers_size: 64,
@@ -472,6 +478,7 @@ mod tests {
                         mime_type: "text/html".to_string(),
                         text: None,
                         encoding: None,
+                        truncated: false,
                     },
                     redirect_url: String::new(),
                     headers_size: -1,
@@ -536,6 +543,7 @@ mod tests {
                     mime_type: String::new(),
                     text: None,
                     encoding: None,
+                    truncated: false,
                 },
                 redirect_url: String::new(),
                 headers_size: 0,

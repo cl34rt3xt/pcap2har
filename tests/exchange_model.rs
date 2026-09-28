@@ -149,6 +149,8 @@ fn duplicate_headers_and_trailers_reach_har_in_wire_order() {
         trailers: vec![("x-response-trailer".to_string(), "done".to_string())],
         body: Vec::new(),
         header_size: 0,
+        encoded_body_size: 0,
+        body_truncated: false,
     });
 
     let har = normalized_exchanges_to_har(vec![value]);

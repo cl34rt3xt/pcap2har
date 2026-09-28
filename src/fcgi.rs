@@ -302,6 +302,7 @@ pub fn fcgi_to_http_response_bounded(
         }
     }
 
+    let encoded_body_size = body.len();
     let (body, body_limit_exceeded) =
         crate::http::decode_body_bounded(body, &headers, max_body_bytes);
 
@@ -313,6 +314,8 @@ pub fn fcgi_to_http_response_bounded(
             headers,
             body,
             header_size: header_data.len(),
+            encoded_body_size,
+            body_truncated: body_limit_exceeded,
         }),
         body_limit_exceeded,
     )

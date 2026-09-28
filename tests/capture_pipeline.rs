@@ -415,9 +415,11 @@ fn gzip_body_expansion_is_bounded_and_reported() {
 
     assert_eq!(report.har.log.entries.len(), 1);
     let response = &report.har.log.entries[0].response;
-    assert_eq!(response.body_size, 1 << 10);
+    // bodySize is what was transferred; content.size is what was decoded (up to the limit)
+    assert_eq!(response.body_size, compressed.len() as i64);
     assert_eq!(response.content.size, 1 << 10);
     assert_eq!(response.content.text.as_ref().unwrap().len(), 1 << 10);
+    assert!(response.content.truncated);
     assert!(report.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == DiagnosticCode::ResourceLimit
             && diagnostic.scope == DiagnosticScope::Capture
@@ -472,6 +474,24 @@ fn decoded_bodies_share_the_conversion_stage_budget() {
     let report = convert_capture(file.path(), options).unwrap();
 
     assert_eq!(report.har.log.entries.len(), 3);
+    let content_sizes: Vec<_> = report
+        .har
+        .log
+        .entries
+        .iter()
+        .map(|entry| entry.response.content.size)
+        .collect();
+    assert_eq!(content_sizes, [3_000, 2_192, 3_000]);
+    let total_body_bytes: i64 = content_sizes.iter().sum();
+    assert_eq!(total_body_bytes, 8 << 10);
+    let truncated: Vec<_> = report
+        .har
+        .log
+        .entries
+        .iter()
+        .map(|entry| entry.response.content.truncated)
+        .collect();
+    assert_eq!(truncated, [false, true, false]);
     let body_sizes: Vec<_> = report
         .har
         .log
@@ -479,15 +499,10 @@ fn decoded_bodies_share_the_conversion_stage_budget() {
         .iter()
         .map(|entry| entry.response.body_size)
         .collect();
-    assert_eq!(body_sizes, [3_000, 2_192, 3_000]);
-    let total_body_bytes: i64 = report
-        .har
-        .log
-        .entries
-        .iter()
-        .map(|entry| entry.response.body_size)
-        .sum();
-    assert_eq!(total_body_bytes, 8 << 10);
+    assert_eq!(
+        body_sizes,
+        [first.len() as i64, second.len() as i64, third.len() as i64]
+    );
     assert!(report
         .diagnostics
         .iter()

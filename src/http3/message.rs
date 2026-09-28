@@ -184,6 +184,8 @@ impl RequestStreamState {
                     version: "HTTP/3".into(),
                     headers: regular_fields(&fields),
                     trailers: regular_fields(&self.response_trailers),
+                    encoded_body_size: self.response_body.len(),
+                    body_truncated: false,
                     body: self.response_body,
                     header_size: field_size(&fields),
                 })

@@ -31,6 +31,11 @@ pub struct ParsedResponse {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub header_size: usize,
+    /// Body length as transferred: after de-chunking, before `Content-Encoding` is undone.
+    pub encoded_body_size: usize,
+    /// `body` is not the whole body: a decode limit was hit, or the capture holds less
+    /// than `Content-Length` or the chunked framing says was sent.
+    pub body_truncated: bool,
 }
 
 pub fn parse_request(data: &[u8]) -> Result<Option<ParsedRequest>, HttpError> {
@@ -62,8 +67,7 @@ pub fn parse_request_bounded(
                 })
                 .collect();
 
-            let (body, _, body_limit_exceeded) =
-                extract_body_bounded(&data[header_len..], &headers, max_body_bytes);
+            let extracted = extract_body_bounded(&data[header_len..], &headers, max_body_bytes);
 
             Ok((
                 Some(ParsedRequest {
@@ -71,10 +75,10 @@ pub fn parse_request_bounded(
                     path,
                     version,
                     headers,
-                    body,
+                    body: extracted.body,
                     header_size: header_len,
                 }),
-                body_limit_exceeded,
+                extracted.limit_exceeded,
             ))
         }
         Ok(Status::Partial) => Err(HttpError::Incomplete),
@@ -121,24 +125,24 @@ pub fn parse_all_requests_bounded(
                     })
                     .collect();
 
-                let (body, body_len, limited) = extract_body_bounded(
+                let extracted = extract_body_bounded(
                     &remaining[header_len..],
                     &headers,
                     max_body_bytes.min(remaining_body_bytes),
                 );
-                remaining_body_bytes = remaining_body_bytes.saturating_sub(body.len());
-                body_limit_exceeded |= limited;
+                remaining_body_bytes = remaining_body_bytes.saturating_sub(extracted.body.len());
+                body_limit_exceeded |= extracted.limit_exceeded;
 
                 requests.push(ParsedRequest {
                     method,
                     path,
                     version,
                     headers,
-                    body,
+                    body: extracted.body,
                     header_size: header_len,
                 });
 
-                offset += header_len + body_len;
+                offset += header_len + extracted.consumed;
             }
             _ => break,
         }
@@ -176,8 +180,7 @@ pub fn parse_response_bounded(
                 })
                 .collect();
 
-            let (body, _, body_limit_exceeded) =
-                extract_body_bounded(&data[header_len..], &headers, max_body_bytes);
+            let extracted = extract_body_bounded(&data[header_len..], &headers, max_body_bytes);
 
             Ok((
                 Some(ParsedResponse {
@@ -185,10 +188,12 @@ pub fn parse_response_bounded(
                     reason,
                     version,
                     headers,
-                    body,
+                    encoded_body_size: extracted.encoded_size,
+                    body_truncated: extracted.truncated(),
+                    body: extracted.body,
                     header_size: header_len,
                 }),
-                body_limit_exceeded,
+                extracted.limit_exceeded,
             ))
         }
         Ok(Status::Partial) => Err(HttpError::Incomplete),
@@ -235,24 +240,26 @@ pub fn parse_all_responses_bounded(
                     })
                     .collect();
 
-                let (body, body_len, limited) = extract_body_bounded(
+                let extracted = extract_body_bounded(
                     &remaining[header_len..],
                     &headers,
                     max_body_bytes.min(remaining_body_bytes),
                 );
-                remaining_body_bytes = remaining_body_bytes.saturating_sub(body.len());
-                body_limit_exceeded |= limited;
+                remaining_body_bytes = remaining_body_bytes.saturating_sub(extracted.body.len());
+                body_limit_exceeded |= extracted.limit_exceeded;
 
                 responses.push(ParsedResponse {
                     status,
                     reason,
                     version,
                     headers,
-                    body,
+                    encoded_body_size: extracted.encoded_size,
+                    body_truncated: extracted.truncated(),
+                    body: extracted.body,
                     header_size: header_len,
                 });
 
-                offset += header_len + body_len;
+                offset += header_len + extracted.consumed;
             }
             _ => break,
         }
@@ -263,15 +270,33 @@ pub fn parse_all_responses_bounded(
 
 #[cfg(test)]
 fn extract_body_with_length(data: &[u8], headers: &[(String, String)]) -> (Vec<u8>, usize) {
-    let (body, consumed, _) = extract_body_bounded(data, headers, usize::MAX);
-    (body, consumed)
+    let extracted = extract_body_bounded(data, headers, usize::MAX);
+    (extracted.body, extracted.consumed)
+}
+
+struct ExtractedBody {
+    /// Decoded body, capped at the body limit.
+    body: Vec<u8>,
+    /// Stream bytes the message body occupies, including chunk framing.
+    consumed: usize,
+    /// Body length as transferred: after de-chunking, before content decoding.
+    encoded_size: usize,
+    limit_exceeded: bool,
+    /// The capture ends before the body does.
+    incomplete: bool,
+}
+
+impl ExtractedBody {
+    fn truncated(&self) -> bool {
+        self.limit_exceeded || self.incomplete
+    }
 }
 
 fn extract_body_bounded(
     data: &[u8],
     headers: &[(String, String)],
     max_body_bytes: usize,
-) -> (Vec<u8>, usize, bool) {
+) -> ExtractedBody {
     let content_length = headers
         .iter()
         .find(|(k, _)| k.to_lowercase() == "content-length")
@@ -281,21 +306,32 @@ fn extract_body_bounded(
         k.to_lowercase() == "transfer-encoding" && v.to_lowercase().contains("chunked")
     });
 
-    let (encoded_body, consumed) = if is_chunked {
-        let body = decode_chunked(data);
+    let (encoded_body, consumed, incomplete) = if is_chunked {
+        let (body, complete) = decode_chunked(data);
         let consumed = find_chunked_end(data);
-        (Cow::Owned(body), consumed)
+        (Cow::Owned(body), consumed, !complete)
     } else if let Some(len) = content_length {
         let actual_len = len.min(data.len());
-        (Cow::Borrowed(&data[..actual_len]), actual_len)
+        (
+            Cow::Borrowed(&data[..actual_len]),
+            actual_len,
+            actual_len < len,
+        )
     } else {
-        (Cow::Borrowed(data), data.len())
+        // delimited by connection close, so whatever was captured is the whole body
+        (Cow::Borrowed(data), data.len(), false)
     };
 
-    let (body, body_limit_exceeded) =
+    let (body, limit_exceeded) =
         decode_body_bounded(encoded_body.as_ref(), headers, max_body_bytes);
 
-    (body, consumed, body_limit_exceeded)
+    ExtractedBody {
+        body,
+        consumed,
+        encoded_size: encoded_body.len(),
+        limit_exceeded,
+        incomplete,
+    }
 }
 
 fn find_chunked_end(data: &[u8]) -> usize {
@@ -331,7 +367,8 @@ fn find_chunked_end(data: &[u8]) -> usize {
     data.len()
 }
 
-fn decode_chunked(data: &[u8]) -> Vec<u8> {
+/// De-chunks `data`, reporting whether the terminating zero-size chunk was reached.
+fn decode_chunked(data: &[u8]) -> (Vec<u8>, bool) {
     let mut result = Vec::new();
     let mut pos = 0;
 
@@ -346,20 +383,22 @@ fn decode_chunked(data: &[u8]) -> Vec<u8> {
         };
 
         let size_str = String::from_utf8_lossy(&data[pos..line_end]);
-        let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
-
-        if size == 0 {
-            break;
-        }
+        let size = match usize::from_str_radix(size_str.trim(), 16) {
+            Ok(0) => return (result, true),
+            Ok(size) => size,
+            // an unparseable size line ends decoding without proving the body is complete
+            Err(_) => break,
+        };
 
         let chunk_start = line_end + 2;
         let Some(chunk_end) = chunk_start.checked_add(size) else {
             break;
         };
 
-        if chunk_end <= data.len() {
-            result.extend_from_slice(&data[chunk_start..chunk_end]);
+        if chunk_end > data.len() {
+            break;
         }
+        result.extend_from_slice(&data[chunk_start..chunk_end]);
 
         let Some(next) = chunk_end.checked_add(2) else {
             break;
@@ -367,7 +406,7 @@ fn decode_chunked(data: &[u8]) -> Vec<u8> {
         pos = next;
     }
 
-    result
+    (result, false)
 }
 
 fn read_bounded(mut decoder: impl Read, max_body_bytes: usize) -> std::io::Result<(Vec<u8>, bool)> {
@@ -727,6 +766,66 @@ mod tests {
     }
 
     #[test]
+    fn response_body_shorter_than_content_length_is_truncated() {
+        let (resp, limited) = parse_response_bounded(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort",
+            1 << 20,
+        )
+        .unwrap();
+        let resp = resp.unwrap();
+
+        assert_eq!(resp.body, b"short");
+        assert_eq!(resp.encoded_body_size, 5);
+        assert!(resp.body_truncated);
+        assert!(!limited);
+    }
+
+    #[test]
+    fn chunked_response_body_is_truncated_only_without_final_chunk() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let parse = |body: &[u8]| {
+            let mut data = head.clone();
+            data.extend_from_slice(body);
+            parse_response_bounded(&data, 1 << 20).unwrap().0.unwrap()
+        };
+
+        let complete = parse(b"3\r\nfoo\r\n0\r\n\r\n");
+        assert_eq!(complete.body, b"foo");
+        assert!(!complete.body_truncated);
+
+        let cut_mid_chunk = parse(b"3\r\nfoo\r\n5\r\nba");
+        assert_eq!(cut_mid_chunk.body, b"foo");
+        assert!(cut_mid_chunk.body_truncated);
+
+        assert!(parse(b"3\r\nfoo\r\n").body_truncated);
+    }
+
+    #[test]
+    fn gzip_response_reports_transferred_size_and_limit_truncation() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&[b'x'; 4096]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut data = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            compressed.len()
+        )
+        .into_bytes();
+        data.extend_from_slice(&compressed);
+
+        let full = parse_response_bounded(&data, 1 << 20).unwrap().0.unwrap();
+        assert_eq!(full.body.len(), 4096);
+        assert_eq!(full.encoded_body_size, compressed.len());
+        assert!(!full.body_truncated);
+
+        let capped = parse_response_bounded(&data, 100).unwrap().0.unwrap();
+        assert_eq!(capped.body.len(), 100);
+        assert_eq!(capped.encoded_body_size, compressed.len());
+        assert!(capped.body_truncated);
+    }
+
+    #[test]
     fn test_parse_incomplete_request() {
         let data = b"GET / HTTP/1.1\r\n";
         let result = parse_request(data);
@@ -761,8 +860,9 @@ mod tests {
                      0\r\n\
                      \r\n";
 
-        let result = decode_chunked(data);
+        let (result, complete) = decode_chunked(data);
         assert_eq!(result, b"foobartest");
+        assert!(complete);
     }
 
     #[test]
