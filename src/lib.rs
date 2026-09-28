@@ -38,6 +38,7 @@ mod model_tests {
         assert_eq!(limits.max_connections, 16_384);
         assert_eq!(limits.max_streams_per_connection, 4_096);
         assert_eq!(limits.max_ranges_per_stream, 1_024);
+        assert_eq!(limits.max_segments_per_stream, 32_768);
         assert_eq!(limits.max_stream_bytes, 16 << 20);
         assert_eq!(limits.max_connection_bytes, 64 << 20);
         assert_eq!(limits.max_total_buffered_bytes, 256 << 20);

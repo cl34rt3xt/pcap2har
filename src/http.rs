@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use flate2::read::GzDecoder;
+use flate2::read::{DeflateDecoder, MultiGzDecoder, ZlibDecoder};
 use httparse::{Request, Response, Status, EMPTY_HEADER};
 use std::borrow::Cow;
 use std::io::Read;
@@ -370,12 +370,8 @@ fn decode_chunked(data: &[u8]) -> Vec<u8> {
     result
 }
 
-fn decompress_gzip_bounded(
-    data: &[u8],
-    max_body_bytes: usize,
-) -> Result<(Vec<u8>, bool), std::io::Error> {
-    let mut decoder = GzDecoder::new(data);
-    let mut decompressed = Vec::with_capacity(data.len().min(max_body_bytes));
+fn read_bounded(mut decoder: impl Read, max_body_bytes: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut decompressed = Vec::new();
     let mut buffer = [0_u8; 8 << 10];
 
     loop {
@@ -396,25 +392,53 @@ fn decompress_gzip_bounded(
     }
 }
 
+fn decompress_bounded(
+    coding: &str,
+    data: &[u8],
+    max_body_bytes: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    match coding {
+        "gzip" | "x-gzip" => read_bounded(MultiGzDecoder::new(data), max_body_bytes),
+        // RFC 9110 "deflate" is zlib-wrapped, but some servers send raw deflate.
+        "deflate" => read_bounded(ZlibDecoder::new(data), max_body_bytes)
+            .or_else(|_| read_bounded(DeflateDecoder::new(data), max_body_bytes)),
+        _ => Err(std::io::ErrorKind::Unsupported.into()),
+    }
+}
+
 pub(crate) fn copy_body_bounded(data: &[u8], max_body_bytes: usize) -> (Vec<u8>, bool) {
     let copied = data.len().min(max_body_bytes);
     (data[..copied].to_vec(), copied < data.len())
 }
 
+/// Undoes every `Content-Encoding` in reverse order of application. If any coding
+/// is unsupported or fails to decode, the body is returned as captured.
 pub(crate) fn decode_body_bounded(
     data: &[u8],
     headers: &[(String, String)],
     max_body_bytes: usize,
 ) -> (Vec<u8>, bool) {
-    let is_gzip = headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("content-encoding") && value.to_ascii_lowercase().contains("gzip")
-    });
-    if is_gzip {
-        decompress_gzip_bounded(data, max_body_bytes)
-            .unwrap_or_else(|_| copy_body_bounded(data, max_body_bytes))
-    } else {
-        copy_body_bounded(data, max_body_bytes)
+    let codings: Vec<String> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|coding| coding.trim().to_ascii_lowercase())
+        .filter(|coding| !coding.is_empty() && coding != "identity")
+        .collect();
+
+    let mut body = Cow::Borrowed(data);
+    let mut limited = false;
+    for coding in codings.iter().rev() {
+        match decompress_bounded(coding, &body, max_body_bytes) {
+            Ok((decoded, decoded_limited)) => {
+                body = Cow::Owned(decoded);
+                limited |= decoded_limited;
+            }
+            Err(_) => return copy_body_bounded(data, max_body_bytes),
+        }
     }
+    let (body, copy_limited) = copy_body_bounded(&body, max_body_bytes);
+    (body, limited || copy_limited)
 }
 
 #[derive(Debug)]
@@ -564,6 +588,65 @@ mod tests {
 
         assert!(limited);
         assert_eq!(parsed.unwrap().body, original[..256]);
+    }
+
+    fn response_with_encoding(content_encoding: &str, body: &[u8]) -> Vec<u8> {
+        let mut message = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: {content_encoding}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        message.extend_from_slice(body);
+        message
+    }
+
+    #[test]
+    fn deflate_bodies_are_decoded_whether_zlib_wrapped_or_raw() {
+        use flate2::write::{DeflateEncoder, ZlibEncoder};
+        let original = b"<html>deflated body</html>".repeat(20);
+        let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+        zlib.write_all(&original).unwrap();
+        let mut raw = DeflateEncoder::new(Vec::new(), Compression::default());
+        raw.write_all(&original).unwrap();
+
+        for compressed in [zlib.finish().unwrap(), raw.finish().unwrap()] {
+            let message = response_with_encoding("deflate", &compressed);
+            let (parsed, limited) = parse_response_bounded(&message, usize::MAX).unwrap();
+            assert!(!limited);
+            assert_eq!(parsed.unwrap().body, original);
+        }
+    }
+
+    #[test]
+    fn stacked_content_encodings_are_decoded_in_reverse_order() {
+        use flate2::write::ZlibEncoder;
+        let original = b"stacked".repeat(50);
+        let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+        zlib.write_all(&original).unwrap();
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&zlib.finish().unwrap()).unwrap();
+
+        let message = response_with_encoding("Deflate, GZIP", &gzip.finish().unwrap());
+        let (parsed, _) = parse_response_bounded(&message, usize::MAX).unwrap();
+
+        assert_eq!(parsed.unwrap().body, original);
+    }
+
+    #[test]
+    fn unsupported_or_corrupt_encodings_keep_the_captured_body() {
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(b"payload").unwrap();
+        let gzip = gzip.finish().unwrap();
+
+        for (coding, body) in [
+            ("br", &b"brotli bytes"[..]),
+            ("br, gzip", &gzip[..]),
+            ("gzip", b"not gzip"),
+        ] {
+            let message = response_with_encoding(coding, body);
+            let (parsed, _) = parse_response_bounded(&message, usize::MAX).unwrap();
+            assert_eq!(parsed.unwrap().body, body, "{coding}");
+        }
     }
 
     #[test]

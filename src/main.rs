@@ -32,6 +32,10 @@ struct Cli {
     /// Maximum buffered payload budget per conversion stage in MiB
     #[arg(long, value_name = "MIB", default_value = "256")]
     max_memory_mib: String,
+
+    /// Maximum size of a single decoded HTTP body in MiB; larger bodies are truncated
+    #[arg(long, value_name = "MIB", default_value = "16")]
+    max_body_mib: String,
 }
 
 fn main() {
@@ -62,16 +66,30 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<i32, String> {
-    let max_memory_bytes = parse_memory_bytes(&cli.max_memory_mib)?;
+    let max_memory_bytes = parse_mib("--max-memory-mib", &cli.max_memory_mib)?;
+    let max_body_bytes = parse_mib("--max-body-mib", &cli.max_body_mib)?;
     let defaults = DecodeLimits::default();
+    // A body can only be as large as the stream and connection that carry it, so
+    // those caps grow with the body cap (headroom for headers and the other direction).
+    let max_stream_bytes = defaults
+        .max_stream_bytes
+        .max(max_body_bytes.saturating_add(defaults.max_header_section_bytes));
+    // Sized for 512-byte segments so the TCP segment count never binds before the byte cap.
+    let max_segments_per_stream = defaults
+        .max_segments_per_stream
+        .max(max_stream_bytes.min(max_memory_bytes) / 512);
+    let max_connection_bytes = defaults
+        .max_connection_bytes
+        .max(max_stream_bytes.saturating_mul(2));
     let limits = DecodeLimits {
         capture_buffer_bytes: defaults.capture_buffer_bytes.min(max_memory_bytes),
-        max_stream_bytes: defaults.max_stream_bytes.min(max_memory_bytes),
-        max_connection_bytes: defaults.max_connection_bytes.min(max_memory_bytes),
+        max_stream_bytes: max_stream_bytes.min(max_memory_bytes),
+        max_segments_per_stream,
+        max_connection_bytes: max_connection_bytes.min(max_memory_bytes),
         max_total_buffered_bytes: max_memory_bytes,
         max_frame_bytes: defaults.max_frame_bytes.min(max_memory_bytes),
         max_header_section_bytes: defaults.max_header_section_bytes.min(max_memory_bytes),
-        max_body_bytes: defaults.max_body_bytes.min(max_memory_bytes),
+        max_body_bytes: max_body_bytes.min(max_memory_bytes),
         max_qpack_table_bytes: defaults.max_qpack_table_bytes.min(max_memory_bytes),
         ..defaults
     };
@@ -93,17 +111,17 @@ fn run(cli: Cli) -> Result<i32, String> {
     })
 }
 
-fn parse_memory_bytes(value: &str) -> Result<usize, String> {
+fn parse_mib(flag: &str, value: &str) -> Result<usize, String> {
     const BYTES_PER_MIB: u128 = 1024 * 1024;
     let mib = value
         .parse::<u128>()
-        .map_err(|_| "invalid --max-memory-mib: expected a positive integer".to_string())?;
+        .map_err(|_| format!("invalid {flag}: expected a positive integer"))?;
     if mib == 0 {
-        return Err("invalid --max-memory-mib: value must be greater than zero".to_string());
+        return Err(format!("invalid {flag}: value must be greater than zero"));
     }
     mib.checked_mul(BYTES_PER_MIB)
         .and_then(|bytes| usize::try_from(bytes).ok())
-        .ok_or_else(|| "invalid --max-memory-mib: value is too large".to_string())
+        .ok_or_else(|| format!("invalid {flag}: value is too large"))
 }
 
 fn write_har(har: &Har, output: Option<&Path>) -> Result<(), String> {

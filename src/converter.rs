@@ -601,10 +601,15 @@ impl Converter {
             .map(|(_, v)| v.split(';').next().unwrap_or("").trim().to_string())
             .unwrap_or_default();
 
+        // Text-like bodies are only emitted as text when that is lossless; anything
+        // else is base64 so the decoded HAR content matches the body bytes exactly.
+        let utf8_text = is_text_content(&mime_type)
+            .then(|| std::str::from_utf8(&resp.body).ok())
+            .flatten();
         let (text, encoding) = if resp.body.is_empty() {
             (Some(String::new()), None)
-        } else if is_text_content(&mime_type) {
-            (Some(String::from_utf8_lossy(&resp.body).to_string()), None)
+        } else if let Some(text) = utf8_text {
+            (Some(text.to_string()), None)
         } else {
             use base64::{engine::general_purpose::STANDARD, Engine};
             (
@@ -1249,6 +1254,27 @@ mod tests {
         assert_eq!(content.mime_type, "image/png");
         assert!(content.text.is_some());
         assert_eq!(content.encoding, Some("base64".to_string()));
+    }
+
+    #[test]
+    fn test_build_content_non_utf8_text_is_base64() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let converter = Converter::new();
+        let body = b"<html>MZ\x90\x00\xff\xfe</html>".to_vec();
+        let resp = ParsedResponse {
+            status: 200,
+            reason: "OK".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("Content-Type".to_string(), "text/html".to_string())],
+            body: body.clone(),
+            header_size: 0,
+        };
+
+        let resp = normalized_response(resp);
+        let content = converter.build_content(&resp);
+        assert_eq!(content.mime_type, "text/html");
+        assert_eq!(content.encoding, Some("base64".to_string()));
+        assert_eq!(STANDARD.decode(content.text.unwrap()).unwrap(), body);
     }
 
     #[test]

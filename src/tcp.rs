@@ -191,7 +191,7 @@ impl TcpReassembler {
         let stream_segments = usage
             .segments
             .checked_add(1)
-            .filter(|segments| *segments <= self.limits.max_ranges_per_stream)
+            .filter(|segments| *segments <= self.limits.max_segments_per_stream)
             .ok_or(TcpError::ResourceLimit)?;
         let connection_bytes = self
             .connections

@@ -127,7 +127,12 @@ pcap2har capture.pcapng -o output.har
 
 # With a sidecar key log
 pcap2har capture.pcapng --keylog sslkeys.log -o output.har
+
+# Keep response bodies up to 64 MiB (default 16 MiB; larger bodies are truncated)
+pcap2har capture.pcapng --max-body-mib 64 -o output.har
 ```
+
+Response bodies are written as plain text only when they have a text-like MIME type and are valid UTF-8; everything else is base64-encoded, so decoding `content.text` always yields the exact body bytes.
 
 ## Viewing HAR Files
 
@@ -191,7 +196,7 @@ The project is organized into several modules:
 - Cookie extraction
 - Query string parsing
 - POST data handling
-- Content encoding (gzip, deflate)
+- Content encoding (gzip, deflate, stacked encodings)
 
 ### HTTP/2
 - Frame parsing
@@ -222,6 +227,7 @@ The project is organized into several modules:
 - **WebSocket**: WebSocket frame parsing is not yet implemented
 - **Fragmented Packets**: Some edge cases in TCP reassembly may not be handled perfectly
 - **IP Fragments**: Fragmented IPv4/IPv6 datagrams are rejected with a diagnostic
+- **Content Encoding**: Only HTTP/1.x and FastCGI bodies are decompressed; Brotli/zstd bodies, and all HTTP/2 and HTTP/3 bodies, are emitted as captured
 - **Decryption Secrets**: Encrypted TLS and QUIC application data requires matching NSS secrets
 
 ## Dependencies

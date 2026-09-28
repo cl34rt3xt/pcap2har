@@ -67,6 +67,7 @@ fn help_lists_capture_controls() {
     assert!(stdout.contains("--keylog <FILE>"));
     assert!(stdout.contains("--strict"));
     assert!(stdout.contains("--max-memory-mib <MIB>"));
+    assert!(stdout.contains("--max-body-mib <MIB>"));
     assert!(stdout.contains("per conversion stage"));
 }
 
@@ -252,6 +253,72 @@ fn invalid_memory_values_are_configuration_exit_one() {
         assert!(output.stdout.is_empty());
         assert!(stderr.contains("invalid --max-memory-mib"));
     }
+}
+
+#[test]
+fn invalid_body_limits_are_configuration_exit_one() {
+    for value in ["0", "abc"] {
+        let output = run(&["--max-body-mib", value, "unused.pcap"]);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(stderr.contains("invalid --max-body-mib"));
+    }
+}
+
+#[test]
+fn bodies_above_default_limit_are_complete_with_larger_max_body_mib() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    // Typical Ethernet MSS, so the per-stream segment cap is exercised too.
+    const SEGMENT: usize = 1_448;
+    // Binary content mislabelled as text/html must survive byte-for-byte.
+    let body: Vec<u8> = (0..(17usize << 20))
+        .map(|i| (i % 251) as u8 | 0x80)
+        .collect();
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&body);
+
+    let mut packets = vec![tcp_frame(
+        50_030,
+        80,
+        b"GET /big HTTP/1.1\r\nHost: example.test\r\n\r\n",
+    )];
+    for (index, chunk) in response.chunks(SEGMENT).enumerate() {
+        packets.push(support::capture::ethernet(
+            0x0800,
+            &support::capture::ipv4_tcp(
+                [192, 0, 2, 20],
+                [192, 0, 2, 10],
+                80,
+                50_030,
+                1 + u32::try_from(index * SEGMENT).unwrap(),
+                false,
+                chunk,
+            ),
+        ));
+    }
+    let capture = TempCapture::new(legacy_pcap_packets(&packets));
+    let path = capture.path().to_str().unwrap();
+
+    let decoded_body = |output: &Output| {
+        assert!(output.status.success());
+        let har: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let content = &har["log"]["entries"][0]["response"]["content"];
+        assert_eq!(content["encoding"], "base64");
+        STANDARD.decode(content["text"].as_str().unwrap()).unwrap()
+    };
+
+    let default = decoded_body(&run(&[path]));
+    assert!(default.len() < body.len());
+    assert_eq!(default, body[..default.len()]);
+
+    let raised = decoded_body(&run(&["--max-body-mib", "32", path]));
+    assert_eq!(raised, body);
 }
 
 #[test]
