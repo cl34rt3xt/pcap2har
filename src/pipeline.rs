@@ -196,6 +196,7 @@ impl ConversionPipeline {
             }
         }
         let mut converter = Converter::with_limits(&self.options.limits);
+        converter.set_body_summary(self.options.body_summary_bytes);
         for (_, session) in http3_sessions {
             let output = session.finish();
             for exchange in output.exchanges {

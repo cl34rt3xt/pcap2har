@@ -5,6 +5,8 @@ pub struct ConversionOptions {
     pub keylog: Option<PathBuf>,
     pub strict: bool,
     pub limits: DecodeLimits,
+    /// Replace body text with hashes and a base64 prefix of this many bytes.
+    pub body_summary_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone)]

@@ -127,6 +127,35 @@ pub struct PostData {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<Vec<Param>>,
+    #[serde(flatten)]
+    pub summary: Option<BodySummary>,
+}
+
+/// Custom HAR fields that stand in for a body's text in `--body-summary` mode, so the
+/// HAR stays small however large the bodies are.
+#[derive(Debug, Serialize)]
+pub struct BodySummary {
+    /// Hex SHA-1 of the whole (decoded) body.
+    #[serde(rename = "_sha1")]
+    pub sha1: String,
+    /// Hex SHA-256 of the whole (decoded) body.
+    #[serde(rename = "_sha256")]
+    pub sha256: String,
+    /// Base64 of the body's first bytes.
+    #[serde(rename = "_prefix")]
+    pub prefix: String,
+}
+
+impl BodySummary {
+    pub fn of(body: &[u8], prefix_bytes: usize) -> Self {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use sha1::Digest;
+        Self {
+            sha1: hex::encode(sha1::Sha1::digest(body)),
+            sha256: hex::encode(sha2::Sha256::digest(body)),
+            prefix: STANDARD.encode(&body[..body.len().min(prefix_bytes)]),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -156,6 +185,8 @@ pub struct Content {
     /// the capture ends before the body does), so `size` and any hash of it are partial.
     #[serde(rename = "_truncated", skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    #[serde(flatten)]
+    pub summary: Option<BodySummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -294,6 +325,7 @@ mod tests {
                     text: None,
                     encoding: None,
                     truncated: false,
+                    summary: None,
                 },
                 redirect_url: String::new(),
                 headers_size: -1,
@@ -370,6 +402,7 @@ mod tests {
                     mime_type: "application/json".to_string(),
                     text: Some(r#"{"key":"value"}"#.to_string()),
                     params: None,
+                    summary: None,
                 }),
                 headers_size: 128,
                 body_size: 15,
@@ -396,6 +429,7 @@ mod tests {
                     text: Some(r#"{"ok":true}"#.to_string()),
                     encoding: None,
                     truncated: false,
+                    summary: None,
                 },
                 redirect_url: String::new(),
                 headers_size: 64,
@@ -485,6 +519,7 @@ mod tests {
                         text: None,
                         encoding: None,
                         truncated: false,
+                        summary: None,
                     },
                     redirect_url: String::new(),
                     headers_size: -1,
@@ -551,6 +586,7 @@ mod tests {
                     text: None,
                     encoding: None,
                     truncated: false,
+                    summary: None,
                 },
                 redirect_url: String::new(),
                 headers_size: 0,

@@ -4,8 +4,8 @@ use crate::fcgi::{
     parse_fcgi_response,
 };
 use crate::har::{
-    Cache, Content, Cookie, Entry, Har, Header, Param, PostData, QueryParam, Request, Response,
-    Timings,
+    BodySummary, Cache, Content, Cookie, Entry, Har, Header, Param, PostData, QueryParam, Request,
+    Response, Timings,
 };
 use crate::http::{
     copy_body_bounded, parse_all_requests_bounded, parse_all_responses_bounded,
@@ -28,6 +28,7 @@ pub struct Converter {
     max_body_bytes: usize,
     remaining_body_bytes: usize,
     body_limit_exceeded: bool,
+    body_summary_bytes: Option<usize>,
 }
 
 impl Converter {
@@ -42,7 +43,13 @@ impl Converter {
             max_body_bytes: limits.max_body_bytes,
             remaining_body_bytes: limits.max_total_buffered_bytes,
             body_limit_exceeded: false,
+            body_summary_bytes: None,
         }
+    }
+
+    /// Emit a `BodySummary` (hashes and the first `prefix_bytes`) in place of body text.
+    pub(crate) fn set_body_summary(&mut self, prefix_bytes: Option<usize>) {
+        self.body_summary_bytes = prefix_bytes;
     }
 
     pub(crate) fn body_limit_exceeded(&self) -> bool {
@@ -485,7 +492,7 @@ impl Converter {
 
     pub fn to_har(mut self) -> Har {
         assign_tcp_connection_sequences(&mut self.exchanges, &self.tcp_exchange_indices);
-        normalized_exchanges_to_har(self.exchanges)
+        exchanges_to_har(self.exchanges, self.body_summary_bytes)
     }
 
     fn exchange_to_entry(&self, exchange: &NormalizedExchange) -> Entry {
@@ -589,6 +596,7 @@ impl Converter {
                     text: None,
                     encoding: None,
                     truncated: false,
+                    summary: None,
                 },
                 redirect_url: String::new(),
                 headers_size: -1,
@@ -610,6 +618,17 @@ impl Converter {
         let utf8_text = is_text_content(&mime_type)
             .then(|| std::str::from_utf8(&resp.body).ok())
             .flatten();
+        if let Some(prefix_bytes) = self.body_summary_bytes {
+            return Content {
+                size: resp.body.len() as i64,
+                compression: None,
+                mime_type,
+                text: None,
+                encoding: None,
+                truncated: resp.body_truncated,
+                summary: Some(BodySummary::of(&resp.body, prefix_bytes)),
+            };
+        }
         let (text, encoding) = if resp.body.is_empty() {
             (Some(String::new()), None)
         } else if let Some(text) = utf8_text {
@@ -629,6 +648,7 @@ impl Converter {
             text,
             encoding,
             truncated: resp.body_truncated,
+            summary: None,
         }
     }
 
@@ -723,6 +743,15 @@ impl Converter {
 
         let mime_type = content_type.split(';').next().unwrap_or("").trim();
 
+        if let Some(prefix_bytes) = self.body_summary_bytes {
+            return Some(PostData {
+                mime_type: mime_type.to_string(),
+                text: None,
+                params: None,
+                summary: Some(BodySummary::of(&req.body, prefix_bytes)),
+            });
+        }
+
         if mime_type == "application/x-www-form-urlencoded" {
             let text = String::from_utf8_lossy(&req.body);
             let params: Vec<Param> = text
@@ -744,12 +773,14 @@ impl Converter {
                 mime_type: mime_type.to_string(),
                 text: Some(text.to_string()),
                 params: Some(params),
+                summary: None,
             })
         } else {
             Some(PostData {
                 mime_type: mime_type.to_string(),
                 text: Some(String::from_utf8_lossy(&req.body).to_string()),
                 params: None,
+                summary: None,
             })
         }
     }
@@ -881,7 +912,14 @@ fn assign_tcp_connection_sequences(
     }
 }
 
-pub fn normalized_exchanges_to_har(mut exchanges: Vec<NormalizedExchange>) -> Har {
+pub fn normalized_exchanges_to_har(exchanges: Vec<NormalizedExchange>) -> Har {
+    exchanges_to_har(exchanges, None)
+}
+
+fn exchanges_to_har(
+    mut exchanges: Vec<NormalizedExchange>,
+    body_summary_bytes: Option<usize>,
+) -> Har {
     exchanges.sort_by(|left, right| {
         left.request_started_ns
             .cmp(&right.request_started_ns)
@@ -890,7 +928,8 @@ pub fn normalized_exchanges_to_har(mut exchanges: Vec<NormalizedExchange>) -> Ha
             .then_with(|| left.cmp(right))
     });
 
-    let converter = Converter::new();
+    let mut converter = Converter::new();
+    converter.set_body_summary(body_summary_bytes);
     let mut har = Har::new();
     for exchange in &exchanges {
         har.add_entry(converter.exchange_to_entry(exchange));

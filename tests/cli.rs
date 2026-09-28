@@ -68,7 +68,62 @@ fn help_lists_capture_controls() {
     assert!(stdout.contains("--strict"));
     assert!(stdout.contains("--max-memory-mib <MIB>"));
     assert!(stdout.contains("--max-body-mib <MIB>"));
+    assert!(stdout.contains("--body-summary <BYTES>"));
     assert!(stdout.contains("per conversion stage"));
+}
+
+#[test]
+fn body_summary_replaces_bodies_with_hashes_and_prefix() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use sha1::Digest;
+    let body: Vec<u8> = (0..5_000u32).map(|i| (i % 251) as u8).collect();
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&body);
+    let upload = b"secret=exfiltrated-data";
+    let mut post = format!(
+        "POST /up HTTP/1.1\r\nHost: example.test\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n",
+        upload.len()
+    )
+    .into_bytes();
+    post.extend_from_slice(upload);
+    let capture = TempCapture::new(legacy_pcap_packets(&[
+        tcp_frame(50_060, 80, &post),
+        support::capture::ethernet(
+            0x0800,
+            &support::capture::ipv4_tcp(
+                [192, 0, 2, 20],
+                [192, 0, 2, 10],
+                80,
+                50_060,
+                1,
+                false,
+                &response,
+            ),
+        ),
+    ]));
+
+    let output = run(&["--body-summary", "4", capture.path().to_str().unwrap()]);
+    let har: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entry = &har["log"]["entries"][0];
+    let content = &entry["response"]["content"];
+    let post_data = &entry["request"]["postData"];
+
+    assert!(output.status.success());
+    assert!(content.get("text").is_none() && content.get("encoding").is_none());
+    assert_eq!(content["size"], 5_000);
+    assert_eq!(content["_sha1"], hex::encode(sha1::Sha1::digest(&body)));
+    assert_eq!(content["_sha256"], hex::encode(sha2::Sha256::digest(&body)));
+    assert_eq!(content["_prefix"], STANDARD.encode(&body[..4]));
+    assert!(post_data.get("text").is_none() && post_data.get("params").is_none());
+    assert_eq!(
+        post_data["_sha256"],
+        hex::encode(sha2::Sha256::digest(upload))
+    );
+    assert_eq!(post_data["_prefix"], STANDARD.encode(b"secr"));
 }
 
 #[test]

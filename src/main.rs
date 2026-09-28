@@ -36,6 +36,11 @@ struct Cli {
     /// Maximum size of a single decoded HTTP body in MiB; larger bodies are truncated
     #[arg(long, value_name = "MIB", default_value = "16")]
     max_body_mib: String,
+
+    /// Emit each body as _sha1/_sha256 hashes and a base64 _prefix of its first BYTES bytes
+    /// instead of its full text, keeping the HAR small
+    #[arg(long, value_name = "BYTES")]
+    body_summary: Option<usize>,
 }
 
 fn main() {
@@ -97,6 +102,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         keylog: cli.keylog,
         strict: cli.strict,
         limits,
+        body_summary_bytes: cli.body_summary,
     };
 
     let report = convert_capture(&cli.input, options)
