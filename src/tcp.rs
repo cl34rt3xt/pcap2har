@@ -60,6 +60,20 @@ impl TcpStream {
     }
 
     pub fn reassemble(&self) -> (Vec<u8>, Vec<DateTime<Utc>>) {
+        let (data, arrivals) = self.reassemble_with_arrivals();
+        (
+            data,
+            arrivals
+                .into_iter()
+                .map(|(_, timestamp)| timestamp)
+                .collect(),
+        )
+    }
+
+    /// Reassembles the stream and reports, for each segment that contributed data, the
+    /// offset in the reassembled bytes where its data starts and when it arrived, so a
+    /// message can be timed by the segments that actually carried it.
+    pub fn reassemble_with_arrivals(&self) -> (Vec<u8>, Vec<(usize, DateTime<Utc>)>) {
         if self.segments.is_empty() {
             return (Vec::new(), Vec::new());
         }
@@ -80,20 +94,20 @@ impl TcpStream {
 
             match next_seq {
                 None => {
+                    timestamps.push((data.len(), segment.timestamp));
                     data.extend_from_slice(&segment.data);
-                    timestamps.push(segment.timestamp);
                     next_seq = Some(seg_end);
                 }
                 Some(expected) => {
                     if segment.seq >= expected {
+                        timestamps.push((data.len(), segment.timestamp));
                         data.extend_from_slice(&segment.data);
-                        timestamps.push(segment.timestamp);
                         next_seq = Some(seg_end);
                     } else if seg_end > expected {
                         let overlap = (expected - segment.seq) as usize;
                         if overlap < segment.data.len() {
+                            timestamps.push((data.len(), segment.timestamp));
                             data.extend_from_slice(&segment.data[overlap..]);
-                            timestamps.push(segment.timestamp);
                             next_seq = Some(seg_end);
                         }
                     }

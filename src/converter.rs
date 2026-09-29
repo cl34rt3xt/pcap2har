@@ -8,7 +8,7 @@ use crate::har::{
     Response, Timings,
 };
 use crate::http::{
-    copy_body_bounded, parse_all_requests_bounded, parse_all_responses_bounded,
+    copy_body_bounded, parse_all_requests_with_spans, parse_all_responses_with_spans,
     parse_request_bounded, parse_response_bounded, HttpConversation, ParsedRequest, ParsedResponse,
 };
 use crate::http2::{is_http2, parse_http2_frames, parse_http2_stream, Http2Request, Http2Response};
@@ -21,6 +21,9 @@ use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use url::Url;
+
+/// Messages parsed from one stream, each with the arrival times of the segments that carried it.
+type TimedMessages<T> = Vec<(Vec<DateTime<Utc>>, T)>;
 
 pub struct Converter {
     exchanges: Vec<NormalizedExchange>,
@@ -87,40 +90,51 @@ impl Converter {
     }
 
     pub fn process_streams(&mut self, streams: HashMap<StreamKey, TcpStream>) {
-        let mut request_streams: HashMap<
-            StreamKey,
-            (Vec<chrono::DateTime<chrono::Utc>>, Vec<ParsedRequest>),
-        > = HashMap::new();
-        let mut response_streams: HashMap<
-            StreamKey,
-            (Vec<chrono::DateTime<chrono::Utc>>, Vec<ParsedResponse>),
-        > = HashMap::new();
+        // per stream: each message with the arrival times of the segments that carried it
+        let mut request_streams: HashMap<StreamKey, TimedMessages<ParsedRequest>> = HashMap::new();
+        let mut response_streams: HashMap<StreamKey, TimedMessages<ParsedResponse>> =
+            HashMap::new();
 
         let mut ordered_streams: Vec<_> = streams.iter().collect();
         ordered_streams.sort_by(|(left, _), (right, _)| left.cmp(right));
         for (key, stream) in ordered_streams {
-            let (data, timestamps) = stream.reassemble();
+            let (data, arrivals) = stream.reassemble_with_arrivals();
             if data.is_empty() {
                 continue;
             }
+            let timestamps: Vec<_> = arrivals.iter().map(|(_, timestamp)| *timestamp).collect();
 
-            let (requests, limited) =
-                parse_all_requests_bounded(&data, self.max_body_bytes, self.remaining_body_bytes);
+            let (requests, limited) = parse_all_requests_with_spans(
+                &data,
+                self.max_body_bytes,
+                self.remaining_body_bytes,
+            );
             if !requests.is_empty() {
-                for request in &requests {
+                for (request, _) in &requests {
                     self.account_body(request.body.len(), limited);
                 }
-                request_streams.insert(key.clone(), (timestamps.clone(), requests));
+                let requests = requests
+                    .into_iter()
+                    .map(|(request, span)| (arrival_times(&arrivals, span), request))
+                    .collect();
+                request_streams.insert(key.clone(), requests);
                 continue;
             }
 
-            let (responses, limited) =
-                parse_all_responses_bounded(&data, self.max_body_bytes, self.remaining_body_bytes);
+            let (responses, limited) = parse_all_responses_with_spans(
+                &data,
+                self.max_body_bytes,
+                self.remaining_body_bytes,
+            );
             if !responses.is_empty() {
-                for response in &responses {
+                for (response, _) in &responses {
                     self.account_body(response.body.len(), limited);
                 }
-                response_streams.insert(key.clone(), (timestamps.clone(), responses));
+                let responses = responses
+                    .into_iter()
+                    .map(|(response, span)| (arrival_times(&arrivals, span), response))
+                    .collect();
+                response_streams.insert(key.clone(), responses);
                 continue;
             }
 
@@ -129,7 +143,7 @@ impl Converter {
                     fcgi_to_http_request_bounded(&fcgi_req, self.available_body_bytes());
                 if let Some(req) = request {
                     self.account_body(req.body.len(), limited);
-                    request_streams.insert(key.clone(), (timestamps.clone(), vec![req]));
+                    request_streams.insert(key.clone(), vec![(timestamps, req)]);
                     continue;
                 }
             }
@@ -139,22 +153,22 @@ impl Converter {
                     fcgi_to_http_response_bounded(&fcgi_resp, self.available_body_bytes());
                 if let Some(resp) = response {
                     self.account_body(resp.body.len(), limited);
-                    response_streams.insert(key.clone(), (timestamps.clone(), vec![resp]));
+                    response_streams.insert(key.clone(), vec![(timestamps, resp)]);
                 }
             }
         }
 
-        for (req_key, (req_timestamps, requests)) in &request_streams {
-            let resp_key = req_key.reverse();
-            let response_data = response_streams.get(&resp_key);
-
-            let responses = response_data
-                .map(|(_, resps)| resps.as_slice())
+        for (req_key, requests) in &request_streams {
+            let responses = response_streams
+                .get(&req_key.reverse())
+                .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let resp_timestamps = response_data.map(|(ts, _)| ts.clone()).unwrap_or_default();
 
-            for (i, request) in requests.iter().enumerate() {
-                let response = responses.get(i).cloned();
+            for (i, (request_timestamps, request)) in requests.iter().enumerate() {
+                let (response_timestamps, response) = match responses.get(i) {
+                    Some((timestamps, response)) => (timestamps.clone(), Some(response.clone())),
+                    None => (Vec::new(), None),
+                };
 
                 let conversation = HttpConversation {
                     request: request.clone(),
@@ -163,8 +177,8 @@ impl Converter {
                     dst_ip: req_key.dst_ip.to_string(),
                     src_port: req_key.src_port,
                     dst_port: req_key.dst_port,
-                    request_timestamps: req_timestamps.clone(),
-                    response_timestamps: resp_timestamps.clone(),
+                    request_timestamps: request_timestamps.clone(),
+                    response_timestamps,
                 };
 
                 self.add_conversation(conversation, "http", None, 0);
@@ -919,6 +933,29 @@ fn normalize_authority(authority: &str, scheme: &str) -> String {
     host_port.to_string()
 }
 
+/// Arrival times of the segments that carried bytes `span` of a reassembled stream, given each
+/// contributing segment's (start offset, arrival time) in stream order. As classic pcap2har did,
+/// a message starts when its first byte arrived and ends when its last byte did.
+fn arrival_times(
+    arrivals: &[(usize, DateTime<Utc>)],
+    span: std::ops::Range<usize>,
+) -> Vec<DateTime<Utc>> {
+    let segment_of = |offset: usize| {
+        arrivals
+            .partition_point(|(start, _)| *start <= offset)
+            .saturating_sub(1)
+    };
+    if arrivals.is_empty() {
+        return Vec::new();
+    }
+    let first = segment_of(span.start);
+    let last = segment_of(span.end.saturating_sub(1).max(span.start)).max(first);
+    arrivals[first..=last]
+        .iter()
+        .map(|(_, timestamp)| *timestamp)
+        .collect()
+}
+
 fn authority_from_server(server: SocketAddr, scheme: &str) -> String {
     let host = match server.ip() {
         IpAddr::V4(ip) => ip.to_string(),
@@ -1104,6 +1141,19 @@ mod tests {
             response_timestamps: vec![],
         };
         Converter::new().build_url(&normalize_conversation(conv, "http", None, 0).request)
+    }
+
+    #[test]
+    fn arrival_times_cover_only_the_segments_carrying_a_span() {
+        let at = |seconds| DateTime::<Utc>::from_timestamp(seconds, 0).unwrap();
+        // segments starting at offsets 0, 10 and 25 of the stream
+        let arrivals = [(0, at(1)), (10, at(2)), (25, at(3))];
+
+        assert_eq!(arrival_times(&arrivals, 0..10), [at(1)]);
+        assert_eq!(arrival_times(&arrivals, 10..30), [at(2), at(3)]);
+        assert_eq!(arrival_times(&arrivals, 5..12), [at(1), at(2)]);
+        assert_eq!(arrival_times(&arrivals, 30..30), [at(3)]);
+        assert!(arrival_times(&[], 0..5).is_empty());
     }
 
     #[test]

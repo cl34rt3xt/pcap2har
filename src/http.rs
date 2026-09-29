@@ -3,6 +3,7 @@ use flate2::read::{DeflateDecoder, MultiGzDecoder, ZlibDecoder};
 use httparse::{Request, Response, Status, EMPTY_HEADER};
 use std::borrow::Cow;
 use std::io::Read;
+use std::ops::Range;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -102,6 +103,20 @@ pub fn parse_all_requests_bounded(
     max_body_bytes: usize,
     max_total_body_bytes: usize,
 ) -> (Vec<ParsedRequest>, bool) {
+    let (requests, limited) =
+        parse_all_requests_with_spans(data, max_body_bytes, max_total_body_bytes);
+    (
+        requests.into_iter().map(|(request, _)| request).collect(),
+        limited,
+    )
+}
+
+/// Like `parse_all_requests_bounded`, also returning the byte range each request occupies in `data`.
+pub fn parse_all_requests_with_spans(
+    data: &[u8],
+    max_body_bytes: usize,
+    max_total_body_bytes: usize,
+) -> (Vec<(ParsedRequest, Range<usize>)>, bool) {
     let mut requests = Vec::new();
     let mut offset = 0;
     let mut body_limit_exceeded = false;
@@ -139,16 +154,20 @@ pub fn parse_all_requests_bounded(
                 remaining_body_bytes = remaining_body_bytes.saturating_sub(extracted.body.len());
                 body_limit_exceeded |= extracted.limit_exceeded;
 
-                requests.push(ParsedRequest {
-                    method,
-                    path,
-                    version,
-                    headers,
-                    body: extracted.body,
-                    header_size: header_len,
-                });
+                let end = offset + header_len + extracted.consumed;
+                requests.push((
+                    ParsedRequest {
+                        method,
+                        path,
+                        version,
+                        headers,
+                        body: extracted.body,
+                        header_size: header_len,
+                    },
+                    offset..end,
+                ));
 
-                offset += header_len + extracted.consumed;
+                offset = end;
             }
             _ => break,
         }
@@ -223,6 +242,23 @@ pub fn parse_all_responses_bounded(
     max_body_bytes: usize,
     max_total_body_bytes: usize,
 ) -> (Vec<ParsedResponse>, bool) {
+    let (responses, limited) =
+        parse_all_responses_with_spans(data, max_body_bytes, max_total_body_bytes);
+    (
+        responses
+            .into_iter()
+            .map(|(response, _)| response)
+            .collect(),
+        limited,
+    )
+}
+
+/// Like `parse_all_responses_bounded`, also returning the byte range each response occupies in `data`.
+pub fn parse_all_responses_with_spans(
+    data: &[u8],
+    max_body_bytes: usize,
+    max_total_body_bytes: usize,
+) -> (Vec<(ParsedResponse, Range<usize>)>, bool) {
     let mut responses = Vec::new();
     let mut offset = 0;
     let mut body_limit_exceeded = false;
@@ -260,18 +296,22 @@ pub fn parse_all_responses_bounded(
                 remaining_body_bytes = remaining_body_bytes.saturating_sub(extracted.body.len());
                 body_limit_exceeded |= extracted.limit_exceeded;
 
-                responses.push(ParsedResponse {
-                    status,
-                    reason,
-                    version,
-                    headers,
-                    encoded_body_size: extracted.encoded_size,
-                    body_truncated: extracted.truncated(),
-                    body: extracted.body,
-                    header_size: header_len,
-                });
+                let end = offset + header_len + extracted.consumed;
+                responses.push((
+                    ParsedResponse {
+                        status,
+                        reason,
+                        version,
+                        headers,
+                        encoded_body_size: extracted.encoded_size,
+                        body_truncated: extracted.truncated(),
+                        body: extracted.body,
+                        header_size: header_len,
+                    },
+                    offset..end,
+                ));
 
-                offset += header_len + extracted.consumed;
+                offset = end;
             }
             _ => break,
         }

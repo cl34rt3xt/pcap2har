@@ -119,6 +119,53 @@ fn http2_headers(headers: &[(&[u8], &[u8])]) -> Vec<u8> {
 }
 
 #[test]
+fn keep_alive_exchanges_are_timed_by_their_own_segments() {
+    // legacy_pcap_packets stamps packet i at 2 + i seconds
+    let request = |path: &str| format!("GET {path} HTTP/1.1\r\nHost: example.test\r\n\r\n");
+    let response = |body: &str| {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let (first, second) = (request("/one"), request("/two"));
+    let (first_response, second_response) = (response("1"), response("2"));
+    let client = [192, 0, 2, 10];
+    let server = [192, 0, 2, 20];
+    let file = TempCapture::new(legacy_pcap_packets(&[
+        tcp_frame(client, server, 50_070, 80, 1, first.as_bytes()),
+        tcp_frame(server, client, 80, 50_070, 1, first_response.as_bytes()),
+        tcp_frame(
+            client,
+            server,
+            50_070,
+            80,
+            1 + first.len() as u32,
+            second.as_bytes(),
+        ),
+        tcp_frame(
+            server,
+            client,
+            80,
+            50_070,
+            1 + first_response.len() as u32,
+            second_response.as_bytes(),
+        ),
+    ]));
+
+    let report = convert_capture(file.path(), ConversionOptions::default()).unwrap();
+
+    let entries = &report.har.log.entries;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].request.url, "http://example.test/one");
+    assert_eq!(entries[0].started_date_time.timestamp(), 2);
+    assert_eq!(entries[0].time, 1_000_000_000);
+    assert_eq!(entries[1].request.url, "http://example.test/two");
+    assert_eq!(entries[1].started_date_time.timestamp(), 4);
+    assert_eq!(entries[1].time, 1_000_000_000);
+}
+
+#[test]
 fn tcp_capture_parity() {
     let file = TempCapture::new(legacy_pcap_packets(&http_exchange_frames(50_000)));
 
