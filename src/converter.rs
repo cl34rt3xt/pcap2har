@@ -517,7 +517,12 @@ impl Converter {
     }
 
     fn build_url(&self, request: &NormalizedRequest) -> String {
-        format!("{}://{}{}", request.scheme, request.authority, request.path)
+        format!(
+            "{}://{}{}",
+            request.scheme,
+            normalize_authority(&request.authority, &request.scheme),
+            request.path
+        )
     }
 
     fn build_request(&self, req: &NormalizedRequest, url: &str) -> Request {
@@ -802,9 +807,14 @@ fn normalize_conversation(
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     let client = SocketAddr::new(client_ip, conversation.src_port);
     let server = SocketAddr::new(server_ip, conversation.dst_port);
+    let (target_authority, path) = match split_absolute_form(&conversation.request.path) {
+        Some((target_authority, path)) => (Some(target_authority), path),
+        None => (None, conversation.request.path),
+    };
     let authority = authority
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+        .or(target_authority)
         .or_else(|| {
             conversation
                 .request
@@ -839,7 +849,7 @@ fn normalize_conversation(
             method: conversation.request.method,
             scheme: scheme.to_string(),
             authority,
-            path: conversation.request.path,
+            path,
             version: conversation.request.version,
             headers: conversation.request.headers,
             trailers: Vec::new(),
@@ -871,6 +881,42 @@ fn datetime_to_timestamp(value: &DateTime<Utc>) -> Option<u64> {
 
 fn timestamp_to_datetime(value: u64) -> DateTime<Utc> {
     DateTime::from_timestamp_nanos(i64::try_from(value).unwrap_or(i64::MAX))
+}
+
+/// Splits an absolute-form request target (`GET http://host/path`, as sent to proxies) into
+/// its authority and origin-form path. RFC 9112 3.2.2: the target's authority then takes
+/// precedence over the Host header.
+fn split_absolute_form(target: &str) -> Option<(String, String)> {
+    let rest = ["http://", "https://"].iter().find_map(|prefix| {
+        target
+            .get(..prefix.len())
+            .filter(|scheme| scheme.eq_ignore_ascii_case(prefix))
+            .map(|_| &target[prefix.len()..])
+    })?;
+    let (authority, path) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    Some((authority.to_string(), path))
+}
+
+/// Normalizes an authority for use in a URL: drops userinfo, lowercases the host and
+/// removes a port that is the scheme's default, as URL parsers do.
+fn normalize_authority(authority: &str, scheme: &str) -> String {
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host_port = host_port.to_ascii_lowercase();
+    let default_port = match scheme {
+        "http" => Some(":80"),
+        "https" => Some(":443"),
+        _ => None,
+    };
+    let host_port = match default_port {
+        Some(port) if host_port.ends_with(port) => &host_port[..host_port.len() - port.len()],
+        _ => host_port.strip_suffix(':').unwrap_or(&host_port),
+    };
+    host_port.to_string()
 }
 
 fn authority_from_server(server: SocketAddr, scheme: &str) -> String {
@@ -1035,6 +1081,63 @@ mod tests {
         let exchange = normalize_conversation(conv, "http", None, 0);
         let url = converter.build_url(&exchange.request);
         assert_eq!(url, "http://example.com/api/data");
+    }
+
+    fn url_for(path: &str, host: Option<&str>) -> String {
+        let conv = HttpConversation {
+            request: ParsedRequest {
+                method: "GET".to_string(),
+                path: path.to_string(),
+                version: "HTTP/1.1".to_string(),
+                headers: host
+                    .map(|host| vec![("Host".to_string(), host.to_string())])
+                    .unwrap_or_default(),
+                body: vec![],
+                header_size: 0,
+            },
+            response: None,
+            src_ip: "192.168.1.10".to_string(),
+            dst_ip: "93.184.216.34".to_string(),
+            src_port: 54321,
+            dst_port: 80,
+            request_timestamps: vec![],
+            response_timestamps: vec![],
+        };
+        Converter::new().build_url(&normalize_conversation(conv, "http", None, 0).request)
+    }
+
+    #[test]
+    fn absolute_form_target_supplies_authority_and_path() {
+        assert_eq!(
+            url_for("http://Proxy.Example.com/a?b=1", Some("other.example")),
+            "http://proxy.example.com/a?b=1"
+        );
+        assert_eq!(url_for("HTTP://example.com", None), "http://example.com/");
+        assert_eq!(
+            url_for("http://example.com?x", None),
+            "http://example.com/?x"
+        );
+    }
+
+    #[test]
+    fn authority_is_normalized_like_a_url_parser() {
+        assert_eq!(
+            url_for("/p", Some("Example.COM:80")),
+            "http://example.com/p"
+        );
+        assert_eq!(
+            url_for("/p", Some("example.com:8080")),
+            "http://example.com:8080/p"
+        );
+        assert_eq!(url_for("/p", Some("example.com:")), "http://example.com/p");
+        assert_eq!(
+            url_for("/p", Some("[2001:DB8::1]:80")),
+            "http://[2001:db8::1]/p"
+        );
+        assert_eq!(
+            url_for("/Path/Case", Some("example.com")),
+            "http://example.com/Path/Case"
+        );
     }
 
     #[test]
